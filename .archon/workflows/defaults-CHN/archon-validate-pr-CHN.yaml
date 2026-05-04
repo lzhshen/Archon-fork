@@ -1,0 +1,208 @@
+name: archon-validate-pr-CHN
+description: |
+  使用场景：用户需要对 PR 进行全面验证，在主分支（bug 存在）和特性分支（bug 已修复）上分别测试。
+  触发词："validate PR"、"validate pr #123"、"test this PR"、"verify PR"、"full PR validation"、
+           "validate pull request"、"test PR end-to-end"。
+  执行流程：获取 PR 信息 -> 查找可用端口 -> 并行代码审查（主分支 vs 特性分支）->
+            主分支 E2E 测试（复现 bug）-> 特性分支 E2E 测试（验证修复）-> 最终验证报告。
+  不适用于：纯代码快速审查（请使用 archon-smart-pr-review）、修复问题、一般性探索。
+
+  此工作流设计为可并行运行——每个实例会自行查找可用端口以避免冲突。
+  产出物存放在 $ARTIFACTS_DIR/ 中，并生成验证报告。
+
+provider: claude
+model: opus
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 1：准备工作 —— 获取 PR 信息并分配端口
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fetch-pr
+    bash: |
+      # 从参数中提取 PR 编号
+      PR_NUMBER=$(echo "$ARGUMENTS" | grep -oE '/pull/[0-9]+' | grep -oE '[0-9]+' | head -1)
+      # 备用方案：未找到 URL 路径时提取第一个数字（例如 "validate PR 42"）
+      if [ -z "$PR_NUMBER" ]; then
+        PR_NUMBER=$(echo "$ARGUMENTS" | grep -oE '[0-9]+' | head -1)
+      fi
+      if [ -z "$PR_NUMBER" ]; then
+        # 尝试从当前分支获取 PR 编号
+        PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null)
+      fi
+
+      if [ -z "$PR_NUMBER" ]; then
+        echo "ERROR: No PR number found in arguments: $ARGUMENTS"
+        exit 1
+      fi
+
+      echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+
+      # 获取完整的 PR 详情
+      gh pr view "$PR_NUMBER" --json number,title,body,url,headRefName,baseRefName,files,additions,deletions,changedFiles,state,author,labels,isDraft
+
+  - id: find-ports
+    bash: |
+      # 使用 Bun 让操作系统分配真正空闲的端口（跨平台：Linux、macOS、Windows）
+      BACKEND_PORT=$(bun -e "const s = Bun.serve({port: 0, fetch: () => new Response('')}); console.log(s.port); s.stop()")
+      FRONTEND_PORT=$(bun -e "const s = Bun.serve({port: 0, fetch: () => new Response('')}); console.log(s.port); s.stop()")
+
+      echo "$BACKEND_PORT" > "$ARTIFACTS_DIR/.backend-port"
+      echo "$FRONTEND_PORT" > "$ARTIFACTS_DIR/.frontend-port"
+
+      echo "BACKEND_PORT=$BACKEND_PORT"
+      echo "FRONTEND_PORT=$FRONTEND_PORT"
+
+  - id: resolve-paths
+    bash: |
+      # 解析标准仓库路径（主分支）和工作树路径（特性分支）
+      CANONICAL_REPO=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's|/\.git$||')
+      WORKTREE_PATH=$(pwd)
+      FEATURE_BRANCH=$(git branch --show-current)
+
+      # 获取 PR 分支信息
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number")
+      PR_HEAD=$(gh pr view "$PR_NUMBER" --json headRefName -q '.headRefName')
+      PR_BASE=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
+
+      echo "$CANONICAL_REPO" > "$ARTIFACTS_DIR/.canonical-repo"
+      echo "$WORKTREE_PATH" > "$ARTIFACTS_DIR/.worktree-path"
+      echo "$FEATURE_BRANCH" > "$ARTIFACTS_DIR/.feature-branch"
+      echo "$PR_HEAD" > "$ARTIFACTS_DIR/.pr-head"
+      echo "$PR_BASE" > "$ARTIFACTS_DIR/.pr-base"
+
+      echo "CANONICAL_REPO=$CANONICAL_REPO"
+      echo "WORKTREE_PATH=$WORKTREE_PATH"
+      echo "FEATURE_BRANCH=$FEATURE_BRANCH"
+      echo "PR_HEAD=$PR_HEAD"
+      echo "PR_BASE=$PR_BASE"
+    depends_on: [fetch-pr]
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 2：代码审查 —— 主分支与特性分支并行分析
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: code-review-main
+    command: archon-validate-pr-code-review-main
+    depends_on: [fetch-pr, resolve-paths]
+    context: fresh
+
+  - id: code-review-feature
+    command: archon-validate-pr-code-review-feature
+    depends_on: [fetch-pr, resolve-paths, code-review-main]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 3：E2E 测试 —— 顺序执行（代码审查完成后）
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: classify-testability
+    prompt: |
+      你是一个 PR 可测试性分类器。请判断此 PR 的变更是否可以通过浏览器 E2E 测试进行验证，还是仅能通过代码审查验证。
+
+      ## PR 详情
+
+      $fetch-pr.output
+
+      ## 规则
+
+      - **e2e_testable**：变更影响 Web UI（组件、钩子、样式、服务于前端的 API 路由、
+        SSE 流、布局、用户可见行为）。这些可以通过启动 Archon 并使用 agent-browser 与 UI 交互来验证。
+      - **code_review_only**：变更纯粹是后端逻辑、仅 CLI 相关、工作流引擎、
+        数据库架构、Git 操作、构建工具、测试、文档或其他非 UI 代码。无法进行可视化验证。
+
+      考虑：即使变更在后端，如果它影响前端显示的内容
+      （例如 API 响应格式变更、SSE 事件变更），则属于 e2e_testable。
+    depends_on: [fetch-pr]
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        testable:
+          type: string
+          enum: ["e2e_testable", "code_review_only"]
+        reasoning:
+          type: string
+        test_plan:
+          type: string
+      required: [testable, reasoning, test_plan]
+
+  - id: e2e-test-main
+    command: archon-validate-pr-e2e-main
+    depends_on: [classify-testability, find-ports, resolve-paths, code-review-main, code-review-feature]
+    when: "$classify-testability.output.testable == 'e2e_testable'"
+    context: fresh
+    idle_timeout: 1800000
+
+  - id: e2e-test-feature
+    command: archon-validate-pr-e2e-feature
+    depends_on: [e2e-test-main, find-ports, resolve-paths]
+    when: "$classify-testability.output.testable == 'e2e_testable'"
+    context: fresh
+    idle_timeout: 1800000
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 4：最终报告 —— 综合所有发现
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: cleanup-processes
+    bash: |
+      # 安全措施：清理 E2E 测试遗留的孤儿进程
+      # 在 E2E 节点完成（或超时/失败）后运行，防止进程累积
+      BACKEND_PORT=$(cat "$ARTIFACTS_DIR/.backend-port" 2>/dev/null | tr -d '\n')
+      FRONTEND_PORT=$(cat "$ARTIFACTS_DIR/.frontend-port" 2>/dev/null | tr -d '\n')
+
+      if [ -z "$BACKEND_PORT" ] || [ -z "$FRONTEND_PORT" ]; then
+        echo "No port files found — skipping cleanup"
+        exit 0
+      fi
+
+      echo "Cleaning up ports $BACKEND_PORT and $FRONTEND_PORT..."
+
+      # 根据记录的 PID 文件终止进程
+      for pidfile in "$ARTIFACTS_DIR"/.e2e-*-pid; do
+        if [ -f "$pidfile" ]; then
+          PID=$(cat "$pidfile" | tr -d '\n')
+          echo "Killing PID $PID from $pidfile"
+          kill "$PID" 2>/dev/null || taskkill //F //T //PID "$PID" 2>/dev/null || true
+        fi
+      done
+
+      # 根据端口号终止进程（跨平台备用方案）
+      for PORT in $BACKEND_PORT $FRONTEND_PORT; do
+        fuser -k "$PORT/tcp" 2>/dev/null || true
+        lsof -ti:"$PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
+        netstat -ano 2>/dev/null | grep ":$PORT " | grep LISTENING | awk '{print $5}' | sort -u | while read pid; do
+          taskkill //F //T //PID "$pid" 2>/dev/null || true
+        done
+      done
+
+      # pkill 备用方案：捕获逃逸 PID/端口清理的进程
+      pkill -f "PORT=$BACKEND_PORT.*bun" 2>/dev/null || true
+      pkill -f "vite.*port.*$FRONTEND_PORT" 2>/dev/null || true
+
+      # 仅关闭此工作流的浏览器会话（按会话 ID 限定范围）
+      BROWSER_SESSION=$(cat "$ARTIFACTS_DIR/.browser-session" 2>/dev/null | tr -d '\n')
+      if [ -n "$BROWSER_SESSION" ]; then
+        agent-browser --session "$BROWSER_SESSION" close 2>/dev/null || true
+      fi
+
+      # 如果主分支 E2E 工作树仍然存在则移除（安全措施）
+      CANONICAL_REPO=$(cat "$ARTIFACTS_DIR/.canonical-repo" 2>/dev/null | tr -d '\n')
+      MAIN_E2E_PATH=$(cat "$ARTIFACTS_DIR/.e2e-main-worktree" 2>/dev/null | tr -d '\n')
+      if [ -n "$MAIN_E2E_PATH" ] && [ -n "$CANONICAL_REPO" ] && [ -d "$MAIN_E2E_PATH" ]; then
+        echo "Removing leftover main E2E worktree: $MAIN_E2E_PATH"
+        git -C "$CANONICAL_REPO" worktree remove "$MAIN_E2E_PATH" --force 2>/dev/null || rm -rf "$MAIN_E2E_PATH"
+      fi
+
+      sleep 1
+      echo "Process cleanup complete"
+    depends_on: [e2e-test-main, e2e-test-feature]
+    trigger_rule: all_done
+
+  - id: final-report
+    command: archon-validate-pr-report
+    depends_on: [code-review-main, code-review-feature, e2e-test-main, e2e-test-feature, classify-testability, cleanup-processes]
+    trigger_rule: all_done
+    context: fresh

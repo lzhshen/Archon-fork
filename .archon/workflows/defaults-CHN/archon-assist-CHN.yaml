@@ -1,0 +1,10 @@
+name: archon-assist-CHN
+description: |
+  适用场景：没有其他工作流匹配该请求时使用。
+  处理范围：问答、调试、代码探索、一次性任务、解释说明、CI 失败分析、通用帮助。
+  能力：完整的 Claude Code 智能体，所有工具均可使用。
+  注意：使用辅助模式时会通知用户，以便追踪记录。
+
+nodes:
+  - id: assist
+    command: archon-assist

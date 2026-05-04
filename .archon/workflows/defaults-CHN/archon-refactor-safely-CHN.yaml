@@ -1,0 +1,530 @@
+name: archon-refactor-safely-CHN
+description: |
+  适用场景：用户希望在持续验证和行为保持的前提下安全地重构代码。
+  触发词："refactor"、"refactor safely"、"split this file"、"extract module"、"break up"、
+            "decompose"、"safe refactor"、"split file"、"extract into modules"。
+  流程：扫描重构范围 -> 分析影响（只读）-> 规划有序任务列表 ->
+        逐步执行并在每次编辑后进行类型检查 -> 运行完整验证套件 ->
+        验证行为保持（只读）-> 创建包含前后对比的 PR。
+  不适用于：缺陷修复（请使用 archon-fix-github-issue）、功能开发（请使用 archon-feature-development）、
+            通用架构梳理（请使用 archon-architect）、PR 审查。
+
+  关键安全特性：
+  - 分析和验证节点均为只读（denied_tools: [Write, Edit, Bash]）
+  - PreToolUse 钩子检查每次编辑是否在计划范围内
+  - PostToolUse 钩子在每次文件修改后强制执行类型检查
+  - 行为验证确认重构后未发生逻辑变更
+
+provider: claude
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 1：扫描 — 查找符合重构目标的文件
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: scan-scope
+    bash: |
+      echo "=== REFACTORING TARGET ==="
+      echo "User request: $ARGUMENTS"
+      echo ""
+
+      echo "=== FILE SIZE ANALYSIS (source files by size) ==="
+      find . -name '*.ts' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' -not -name '*.test.ts' -not -name '*.d.ts' \
+        -exec wc -l {} + 2>/dev/null | sort -rn | head -30
+      echo ""
+
+      echo "=== FILES OVER 500 LINES ==="
+      find . -name '*.ts' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' -not -name '*.test.ts' -not -name '*.d.ts' \
+        -exec sh -c 'lines=$(wc -l < "$1"); if [ "$lines" -gt 500 ]; then echo "$lines $1"; fi' _ {} \; 2>/dev/null | sort -rn
+      echo ""
+
+      echo "=== FUNCTION COUNT PER FILE (top 20) ==="
+      for f in $(find . -name '*.ts' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' -not -name '*.test.ts' -not -name '*.d.ts'); do
+        count=$(grep -cE '^\s*(export\s+)?(async\s+)?function\s|=>\s*\{' "$f" 2>/dev/null) || count=0
+        if [ "$count" -gt 5 ]; then
+          echo "$count functions: $f"
+        fi
+      done | sort -rn | head -20
+      echo ""
+
+      echo "=== EXPORT ANALYSIS (files with many exports) ==="
+      for f in $(find . -name '*.ts' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' -not -name '*.test.ts' -not -name '*.d.ts'); do
+        count=$(grep -c "^export " "$f" 2>/dev/null) || count=0
+        if [ "$count" -gt 5 ]; then
+          echo "$count exports: $f"
+        fi
+      done | sort -rn | head -20
+    timeout: 60000
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 2：影响分析 — 只读的深入分析
+  # 映射调用点、识别风险区域、理解依赖关系
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: analyze-impact
+    prompt: |
+      你是一位高级软件工程师，正在为安全重构分析代码。
+
+      ## 重构请求
+
+      $ARGUMENTS
+
+      ## 代码库扫描结果
+
+      $scan-scope.output
+
+      ## 指示
+
+      1. 根据用户请求和上面的扫描结果，确定需要重构的主要目标文件
+      2. 仔细阅读每个目标文件 — 理解每个函数、类型和导出
+      3. 为每个目标文件映射所有调用点：
+         - 使用 Grep 查找代码库中所有导入目标文件的位置
+         - 追踪具体使用了哪些导出以及在哪里使用
+         - 注意通过 index 文件的动态导入或重新导出
+      4. 识别风险区域：
+         - 具有复杂内部依赖的函数（共享闭包、模块级状态）
+         - 文件中函数之间的循环依赖
+         - 任何模块级别的副作用（顶层 `const`、初始化代码）
+         - 属于公共 API 的导出 vs 仅内部使用的导出
+      5. 检查现有测试：
+         - 查找目标模块的测试文件
+         - 记录已测试和未测试的内容
+
+      ## 输出
+
+      将详细的影响分析写入 `$ARTIFACTS_DIR/impact-analysis.md`，包含：
+
+      ### 目标文件
+      - 文件路径、行数、函数数量
+      - 所有导出符号及其简要说明
+
+      ### 依赖映射
+      - 哪些文件从目标文件导入（包含使用的具体导入项）
+      - 目标文件从哪些文件导入
+
+      ### 风险评估
+      - 模块级状态或副作用
+      - 函数间复杂的内部依赖
+      - 必须完全保留的公共 API 接口
+
+      ### 测试覆盖
+      - 现有测试文件及其覆盖范围
+      - 必须持续测试的关键路径
+
+      ### 推荐的拆分策略
+      - 建议的模块边界（哪些函数应归为一组）
+      - 每个分组的理由（内聚性、共享依赖）
+    depends_on: [scan-scope]
+    context: fresh
+    denied_tools: [Write, Edit, Bash]
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 3：规划重构 — 有序任务列表及回滚策略
+  # 只读：生成计划，不执行
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: plan-refactor
+    prompt: |
+      你正在规划一次安全重构。你必须生成一个精确的、有序的计划，
+      另一个 Agent 将严格按照该计划执行。
+
+      ## 影响分析
+
+      $analyze-impact.output
+
+      ## 重构目标
+
+      $ARGUMENTS
+
+      ## 原则
+
+      - **行为保持**：重构不得改变任何行为 — 仅改变结构
+      - **增量执行**：每个步骤都必须使代码库保持可编译状态
+      - **可逆性**：每个步骤都可以独立回滚
+      - **不混合关注点**：不要将重构与缺陷修复或改进混合在一起
+      - **保持公共 API**：所有现有导出必须从相同的导入路径保持可访问
+      - **最大文件大小**：重构后每个文件不超过 500 行
+
+      ## 指示
+
+      1. 从 `$ARTIFACTS_DIR/impact-analysis.md` 读取影响分析
+      2. 阅读目标文件以理解当前结构
+      3. 设计拆分方案：
+         - 将相关函数分组为内聚的模块
+         - 识别共享的工具函数、类型和常量
+         - 规划具有描述性名称的新文件结构
+      4. 编写有序任务列表，每个任务必须：
+         - 独立完成且完成后代码可编译
+         - 明确指定要提取什么以及放到哪里
+         - 清楚说明需要更新的导入
+
+      ## 输出
+
+      将计划写入 `$ARTIFACTS_DIR/refactor-plan.md`，包含：
+
+      ### 文件结构（重构前）
+      ```
+      [当前结构及行数]
+      ```
+
+      ### 文件结构（重构后）
+      ```
+      [计划结构及预估行数]
+      ```
+
+      ### 有序任务
+
+      每个任务的格式：
+      ```
+      ## 任务 N：[简要说明]
+
+      **操作**：CREATE | EXTRACT | UPDATE
+      **源文件**：[源文件]
+      **目标文件**：[目标文件]
+      **移动内容**：
+      - function functionName（第 X-Y 行）
+      - type TypeName（第 X-Y 行）
+
+      **需要更新的导入**：
+      - [文件]：将导入从 [旧的] 改为 [新的]
+
+      **回滚方式**：[如何撤销此特定步骤]
+      ```
+
+      ### 验证命令
+      - 类型检查：`bun run type-check`
+      - 代码检查：`bun run lint`
+      - 测试：`bun run test`
+      - 格式检查：`bun run format:check`
+    depends_on: [analyze-impact]
+    context: fresh
+    denied_tools: [Write, Edit, Bash]
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 4：执行重构 — 在安全防护下执行计划
+  # 钩子在每次编辑后强制类型检查并检查计划遵循情况
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: execute-refactor
+    model: opus[1m]
+    prompt: |
+      你正在严格的安全防护下执行重构计划。
+
+      ## 计划
+
+      从 `$ARTIFACTS_DIR/refactor-plan.md` 读取完整计划 — 严格按照计划执行。
+
+      ## 规则
+
+      - **严格遵循计划** — 不要添加额外的改进或清理
+      - **一次一个任务** — 完全完成当前任务后再开始下一个
+      - **每次文件修改后进行类型检查** — 每次编辑后你都会被提醒执行此操作
+      - **保持所有行为** — 重构意味着移动代码，而不是修改代码
+      - **保持公共 API** — 如果原始文件导出了某个内容，它必须仍然可以从相同路径导入（如需要在原始文件中使用重新导出）
+      - **更新所有导入位置** — 每个从原始文件导入的文件都必须更新
+      - **每个逻辑任务后提交** — 每个计划任务对应一次提交，附带清晰的提交信息
+
+      ## 每个任务的执行流程
+
+      1. 阅读计划任务
+      2. 阅读源文件以理解当前状态
+      3. 创建新文件（如果正在提取）并包含要移动的函数/类型
+      4. 更新源文件以移除已移动的代码并添加从新文件的导入
+      5. 更新原始文件的导出，以从新模块重新导出（保持 API 兼容）
+      6. 使用 Grep 查找并更新代码库中所有导入位置
+      7. 运行 `bun run type-check` 进行验证（钩子会提醒你）
+      8. 仅提交你为此任务编辑的文件 — 禁止使用 `git add -A`。按文件名暂存，然后提交：
+         ```bash
+         git add path/to/file1 path/to/file2 ...
+         git status --porcelain  # 确认没有临时文件被暂存
+         git commit -m "refactor: [任务说明]"
+         ```
+         **禁止暂存**：`.pr-body.md`、`pr-body.md`、`*.scratch.md`、`*.tmp.md`、`review/`、仓库根目录下的 `*-report.md`，以及 `$ARTIFACTS_DIR` 下的任何内容。
+      9. 继续下一个任务
+
+      ## 问题处理
+
+      - 如果修改后类型检查失败：在继续之前立即修复
+      - 如果任务比计划更复杂：仍然完成它，记录偏差
+      - 如果发现计划遗漏了某个导入位置：更新它并记录
+      - 绝不跳过任务 — 按顺序完成
+    depends_on: [plan-refactor]
+    context: fresh
+    hooks:
+      PreToolUse:
+        - matcher: "Write|Edit"
+          response:
+            hookSpecificOutput:
+              hookEventName: PreToolUse
+              additionalContext: >
+                在修改此文件之前：此文件是否在你的重构计划
+                （$ARTIFACTS_DIR/refactor-plan.md）中？如果它既不是计划中的目标文件，
+                也不是从目标文件导入的文件，请解释为什么要修改它。
+                计划外的修改会增加风险。
+      PostToolUse:
+        - matcher: "Write|Edit"
+          response:
+            systemMessage: >
+              你刚刚修改了一个文件。立即停下来，在进行任何其他修改之前
+              执行以下操作：
+              1. 运行 `bun run type-check` 验证修改能够编译通过
+              2. 如果类型检查失败，立即修复错误
+              3. 确认你保持了完全相同的行为 — 没有逻辑变更，仅做结构性移动
+              只有在类型检查通过后才能继续下一次修改。
+        - matcher: "Bash"
+          response:
+            hookSpecificOutput:
+              hookEventName: PostToolUse
+              additionalContext: >
+                检查退出码。如果类型检查或任何验证失败，在继续之前修复问题。
+                不要积累错误状态。
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 5：验证 — 完整测试套件（bash，无 AI 逃避途径）
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    bash: |
+      echo "=== TYPE CHECK ==="
+      bun run type-check 2>&1
+      TC_EXIT=$?
+
+      echo ""
+      echo "=== LINT ==="
+      bun run lint 2>&1
+      LINT_EXIT=$?
+
+      echo ""
+      echo "=== FORMAT CHECK ==="
+      bun run format:check 2>&1
+      FMT_EXIT=$?
+
+      echo ""
+      echo "=== TESTS ==="
+      bun run test 2>&1
+      TEST_EXIT=$?
+
+      echo ""
+      echo "=== FILE SIZE CHECK ==="
+      echo "Files still over 500 lines:"
+      find . -name '*.ts' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' -not -name '*.test.ts' -not -name '*.d.ts' \
+        -exec sh -c 'lines=$(wc -l < "$1"); if [ "$lines" -gt 500 ]; then echo "$lines $1"; fi' _ {} \; 2>/dev/null | sort -rn
+      echo ""
+
+      echo "=== RESULTS ==="
+      echo "Type check: $([ $TC_EXIT -eq 0 ] && echo 'PASS' || echo 'FAIL')"
+      echo "Lint: $([ $LINT_EXIT -eq 0 ] && echo 'PASS' || echo 'FAIL')"
+      echo "Format: $([ $FMT_EXIT -eq 0 ] && echo 'PASS' || echo 'FAIL')"
+      echo "Tests: $([ $TEST_EXIT -eq 0 ] && echo 'PASS' || echo 'FAIL')"
+
+      if [ $TC_EXIT -eq 0 ] && [ $LINT_EXIT -eq 0 ] && [ $FMT_EXIT -eq 0 ] && [ $TEST_EXIT -eq 0 ]; then
+        echo "VALIDATION_STATUS: PASS"
+      else
+        echo "VALIDATION_STATUS: FAIL"
+      fi
+    depends_on: [execute-refactor]
+    timeout: 300000
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 6：修复验证失败（如果有）
+  # 仅在验证失败时执行实际工作
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fix-failures
+    prompt: |
+      查看下面的验证输出。
+
+      ## 验证输出
+
+      $validate.output
+
+      ## 指示
+
+      如果输出以 "VALIDATION_STATUS: PASS" 结尾，请回复
+      "所有检查已通过 — 无需修复。" 然后停止。
+
+      如果存在失败：
+
+      1. 仔细阅读验证失败信息
+      2. 仅修复失败的内容 — 不要进行额外改进
+      3. 如果修复需要改变行为（而不仅仅是修复类型/代码检查错误），
+         请回滚原始修改
+      4. 每次修复后运行具体的失败检查以确认通过
+      5. 所有修复完成后，运行完整验证套件：`bun run validate`
+
+      如果仍有超过 500 行的文件，请记录但不要在此节点中尝试进一步
+      拆分 — 那将需要新的计划周期。
+    depends_on: [validate]
+    context: fresh
+    hooks:
+      PostToolUse:
+        - matcher: "Write|Edit"
+          response:
+            systemMessage: >
+              你刚刚做了一个修复。立即运行具体的失败验证检查
+              以确认修复有效。不要批量修复 — 逐个验证。
+      PreToolUse:
+        - matcher: "Write|Edit"
+          response:
+            hookSpecificOutput:
+              hookEventName: PreToolUse
+              additionalContext: >
+                你仅在进行验证失败修复。不要进行任何超出通过失败检查
+                所需范围的修改。如有疑问，请回滚导致失败的原始修改。
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 7：行为验证 — 只读确认
+  # 通过追踪调用路径确保重构保持了行为
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: verify-behavior
+    prompt: |
+      你是一位代码审查者，正在验证重构是否保持了完全相同的行为。
+      你只能读取文件 — 不能进行任何修改。
+
+      ## 重构计划
+
+      从 `$ARTIFACTS_DIR/refactor-plan.md` 读取计划以了解重构意图。
+
+      ## 指示
+
+      1. 使用 Grep 和 Glob 查找计划中列出的新模块位置的所有文件，然后逐一阅读。
+         （注意：此只读节点禁止使用 Bash，因此请使用 Grep/Glob/Read 而非 git 命令来发现变更。）
+      2. 对于重构创建的每个新文件：
+         - 验证提取的函数与原始函数完全一致（无逻辑变更）
+         - 检查所有类型和接口是否被保留
+      3. 对于原始文件：
+         - 验证先前导出的所有符号都存在重新导出
+         - 确认没有函数体被修改（仅被移动）
+      4. 对于所有更新的导入位置：
+         - 验证导入解析到正确的新位置
+         - 检查是否有遗漏的导入
+      5. 验证公共 API 是否被保留：
+         - 任何从原始文件导入的代码应该无需修改即可继续工作
+         - 原始文件中的重新导出应覆盖所有已移动的符号
+
+      ## 输出
+
+      将验证报告写入 `$ARTIFACTS_DIR/behavior-verification.md`：
+
+      ### 结论：PASS | FAIL
+
+      ### 已验证函数
+      | 函数 | 原始位置 | 新位置 | 行为是否保持 |
+      |----------|------------------|--------------|-------------------|
+      | funcName | file.ts:42 | new-file.ts:10 | 是/否 |
+
+      ### 公共 API 检查
+      - [ ] 所有原始导出仍可从原始导入路径访问
+      - [ ] 重新导出正确配置
+
+      ### 导入位置更新
+      - [ ] 已验证所有 N 个导入位置
+
+      ### 发现的问题
+      [列出检测到的任何行为变更，或 "无 — 重构保持了行为一致性"]
+    depends_on: [fix-failures]
+    context: fresh
+    denied_tools: [Write, Edit, Bash]
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 8：创建 PR — 包含前后对比的详细说明
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      为重构创建一个拉取请求。
+
+      ## 上下文
+
+      - **重构目标**：$ARGUMENTS
+      - **影响分析**：读取 `$ARTIFACTS_DIR/impact-analysis.md`
+      - **重构计划**：读取 `$ARTIFACTS_DIR/refactor-plan.md`
+      - **验证结果**：$validate.output
+      - **行为验证**：读取 `$ARTIFACTS_DIR/behavior-verification.md`
+
+      ## 指示
+
+      1. 如果有未提交的变更，暂存所有变更并创建最终提交
+      2. 推送分支：`git push -u origin HEAD`
+      3. 检查是否已有 PR：`gh pr list --head $(git branch --show-current)`
+      4. 创建以 `$BASE_BRANCH` 为基础分支的 PR：
+         `gh pr create --base $BASE_BRANCH --title "..." --body "..."`，然后按照
+         下面的模板格式化标题/正文
+      5. 将 PR URL 保存到 `$ARTIFACTS_DIR/.pr-url`
+
+      ## PR 格式
+
+      - **标题**：`refactor: [简洁说明]`（不超过 70 个字符）
+      - **正文**：
+
+      ```markdown
+      ## 重构：[目标]
+
+      ### 动机
+
+      [为什么需要此重构 — 文件大小、复杂度、可维护性]
+
+      ### 重构前
+
+      ```
+      [原始文件结构及行数，来自计划]
+      ```
+
+      ### 重构后
+
+      ```
+      [新文件结构及行数]
+      ```
+      ```
+
+      ### 变更内容
+
+      [每个新模块：提取了什么以及为什么它是一个内聚单元]
+
+      ### 安全性
+
+      - [x] 类型检查通过
+      - [x] 代码检查通过
+      - [x] 测试通过（所有现有测试仍为绿色）
+      - [x] 公共 API 已保持（重新导出保持向后兼容）
+      - [x] 行为验证通过（只读审计确认无逻辑变更）
+      - [x] 每个任务单独提交，便于审查和回滚
+
+      ### 审查指南
+
+      每个提交代表一个提取步骤。逐个审查提交最为简便。
+      所有提交均为行为保持的结构性移动。
+      ```
+    depends_on: [verify-behavior]
+    context: fresh
+    hooks:
+      PreToolUse:
+        - matcher: "Write|Edit"
+          response:
+            hookSpecificOutput:
+              hookEventName: PreToolUse
+              permissionDecision: deny
+              permissionDecisionReason: "PR 创建节点 — 请勿修改源文件。仅使用 git 和 gh 命令。"
+      PostToolUse:
+        - matcher: "Bash"
+          response:
+            hookSpecificOutput:
+              hookEventName: PostToolUse
+              additionalContext: >
+                验证此命令是否成功。如果 git push 或 gh pr create 失败，
+                在重试之前仔细阅读错误信息。
+
+  - id: verify-pr-base
+    bash: |
+      set -euo pipefail
+      EXPECTED="$BASE_BRANCH"
+      ACTUAL=$(gh pr view --json baseRefName -q '.baseRefName')
+      if [ "$ACTUAL" != "$EXPECTED" ]; then
+        PR_NUMBER=$(gh pr view --json number -q '.number')
+        echo "Base mismatch on PR #$PR_NUMBER: expected=$EXPECTED actual=$ACTUAL — re-targeting" >&2
+        gh pr edit "$PR_NUMBER" --base "$EXPECTED"
+      else
+        echo "PR base verified: $EXPECTED"
+      fi
+    depends_on: [create-pr]

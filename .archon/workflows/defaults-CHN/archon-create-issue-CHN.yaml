@@ -1,0 +1,589 @@
+name: archon-create-issue-CHN
+description: |
+  适用场景：用户希望将 bug 或问题报告为 GitHub issue，并附带自动化复现过程。
+  触发词："create issue"、"file a bug"、"report this bug"、"open an issue for"、
+          "create github issue"、"report issue"、"log this bug"。
+  执行流程：分类问题领域 (haiku) -> 并行收集上下文（模板、git 状态、重复检查）->
+           调查相关代码 -> 使用领域特定工具复现问题（agent-browser、CLI、数据库查询）->
+           根据复现结果进行门控 -> 创建包含完整证据的 issue，或在无法复现时向用户报告。
+  不适用于：功能请求、增强建议或非 bug 类工作。仅用于 bug/问题报告。
+
+  复现门控：如果问题无法复现，工作流不会创建 issue。
+  相反，它会报告已尝试的操作，并向用户建议后续步骤。
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 1：分类 — 使用 Haiku 对用户问题进行分类
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: classify
+    prompt: |
+      你是 Archon 代码库的问题分类器。分析用户描述，确定问题类型以及系统受影响的领域。
+
+      ## 用户描述
+      $ARGUMENTS
+
+      ## 领域定义
+      | 领域 | 包 | 指标 |
+      |------|----------|------------|
+      | web-ui | @archon/web、@archon/server（路由、Web 适配器） | UI 渲染、SSE 流式传输、React 组件、浏览器行为 |
+      | api-server | @archon/server（路由、中间件） | HTTP 端点、响应码、请求处理 |
+      | cli | @archon/cli | CLI 命令、终端工作流调用、输出格式化 |
+      | isolation | @archon/isolation、@archon/git | 工作树、分支操作、清理、环境生命周期 |
+      | workflows | @archon/workflows | YAML 解析、DAG 执行、变量替换、节点类型 |
+      | database | @archon/core (db/) | SQLite/PostgreSQL 查询、模式、数据完整性、迁移 |
+      | adapters | @archon/adapters | Slack/Telegram/GitHub/Discord 消息处理、认证、轮询 |
+      | core | @archon/core（编排器、处理器、客户端） | 消息路由、会话管理、AI 客户端流式传输 |
+      | other | 上述未涵盖的任何包 | 跨领域关注点、构建工具、配置、未知领域 |
+
+      ## 分类规则
+      - 选择最具体的领域。"SSE 断连" = web-ui（不是 api-server）。
+      - 如果在两个领域之间有歧义，选择更接近用户可见症状的那个。
+      - 仅当问题确实不适合任何特定领域时才使用 "other"。
+      - needs_server：如果复现需要运行 Archon 服务器，则设为 "true"。
+        通常为 true 的领域：web-ui、api-server、core、adapters。
+        通常为 false 的领域：cli、isolation、workflows、database。
+        对于 "other"：根据描述自行判断。
+      - repro_hint：将用户的复现步骤提取为简洁的指令。
+        如果没有明确的步骤，推断最可能触发问题的方式。
+
+      请提供分类的理由。
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: ["bug", "regression", "crash", "performance", "configuration"]
+        area:
+          type: string
+          enum: ["web-ui", "api-server", "cli", "isolation", "workflows", "database", "adapters", "core", "other"]
+        title:
+          type: string
+        keywords:
+          type: string
+        repro_hint:
+          type: string
+        needs_server:
+          type: string
+          enum: ["true", "false"]
+      required: [type, area, title, keywords, repro_hint, needs_server]
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 2：并行上下文收集
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fetch-template
+    bash: |
+      # 在标准位置搜索 GitHub issue 模板
+      TEMPLATES_FOUND=0
+
+      # 检查 issue 模板目录（基于 YAML 的模板）
+      if [ -d ".github/ISSUE_TEMPLATE" ]; then
+        echo "=== 找到 Issue 模板 ==="
+        for f in .github/ISSUE_TEMPLATE/*.md .github/ISSUE_TEMPLATE/*.yaml .github/ISSUE_TEMPLATE/*.yml; do
+          if [ -f "$f" ]; then
+            TEMPLATES_FOUND=$((TEMPLATES_FOUND + 1))
+            echo "--- 模板: $f ---"
+            cat "$f"
+            echo ""
+          fi
+        done
+      fi
+
+      # 检查单一 issue 模板
+      for f in .github/ISSUE_TEMPLATE.md docs/ISSUE_TEMPLATE.md; do
+        if [ -f "$f" ]; then
+          TEMPLATES_FOUND=$((TEMPLATES_FOUND + 1))
+          echo "--- 模板: $f ---"
+          cat "$f"
+        fi
+      done
+
+      if [ "$TEMPLATES_FOUND" -eq 0 ]; then
+        echo "未找到 issue 模板 — 将使用标准格式"
+      fi
+    depends_on: [classify]
+
+  - id: git-context
+    bash: |
+      echo "=== 当前分支 ==="
+      git branch --show-current
+
+      echo "=== 最近提交（最近 15 条）==="
+      git log --oneline -15
+
+      echo "=== 工作树状态 ==="
+      git status --short
+
+      echo "=== 修改文件（最近 3 次提交）==="
+      git diff --name-only HEAD~3..HEAD 2>/dev/null || echo "(少于 3 次提交)"
+
+      echo "=== 环境信息 ==="
+      echo "Node: $(node --version 2>/dev/null || echo 'N/A')"
+      echo "Bun: $(bun --version 2>/dev/null || echo 'N/A')"
+      echo "OS: $(uname -s 2>/dev/null || echo 'Windows') $(uname -r 2>/dev/null || ver 2>/dev/null || echo '')"
+      echo "Platform: $(uname -m 2>/dev/null || echo 'unknown')"
+    depends_on: [classify]
+
+  - id: dedup-check
+    bash: |
+      KEYWORDS=$classify.output.keywords
+      echo "=== 搜索重复 issue: $KEYWORDS ==="
+
+      echo "--- 开放中的 Issue ---"
+      gh issue list --search "$KEYWORDS" --state open --limit 5 --json number,title,url,labels 2>/dev/null || echo "没有匹配的开放 issue"
+
+      echo "--- 最近关闭的 ---"
+      gh issue list --search "$KEYWORDS" --state closed --limit 3 --json number,title,url,labels 2>/dev/null || echo "没有匹配的已关闭 issue"
+    depends_on: [classify]
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 3：调查 — 搜索代码库中与问题相关的代码
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: investigate
+    prompt: |
+      你是代码库调查员。搜索与所报告问题相关的代码。
+
+      ## 问题
+      - **领域**：$classify.output.area
+      - **类型**：$classify.output.type
+      - **标题**：$classify.output.title
+      - **复现提示**：$classify.output.repro_hint
+
+      ## Git 上下文
+      $git-context.output
+
+      ## 指令
+
+      1. 根据领域，搜索相关包：
+         - web-ui: `packages/web/src/`、`packages/server/src/adapters/web/`、`packages/server/src/routes/`
+         - api-server: `packages/server/src/routes/`、`packages/server/src/`
+         - cli: `packages/cli/src/`
+         - isolation: `packages/isolation/src/`、`packages/git/src/`
+         - workflows: `packages/workflows/src/`
+         - database: `packages/core/src/db/`
+         - adapters: `packages/adapters/src/`
+         - core: `packages/core/src/orchestrator/`、`packages/core/src/handlers/`
+         - other: 基于关键词广泛搜索 — 检查 `packages/*/src/`、配置文件、构建脚本
+
+      2. 查找：入口点、错误处理路径、相关类型定义、受影响领域的近期变更
+         （检查特定文件的 git 日志）。
+
+      3. 将调查结果写入 `$ARTIFACTS_DIR/issue-context.md`，结构如下：
+         ```
+         # 代码库调查
+         ## 相关文件
+         - `file:line` — 该位置的代码描述
+         ## 错误处理
+         - 该领域当前如何处理错误
+         ## 近期变更
+         - 任何涉及此代码的近期提交
+         ## 疑似根本原因
+         - 基于代码分析，bug 可能出现的位置
+         ```
+
+      要详尽但有针对性。仅包含与所报告问题直接相关的文件。
+    depends_on: [classify, git-context]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 4：复现 — 针对特定领域的问题复现
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: start-server
+    bash: |
+      # 使用 Bun 的 OS 分配机制获取空闲端口
+      PORT=$(bun -e "const s = Bun.serve({port: 0, fetch: () => new Response('')}); console.log(s.port); s.stop()")
+      echo "$PORT" > "$ARTIFACTS_DIR/.server-port"
+
+      # 在后台启动开发服务器
+      PORT=$PORT bun run dev:server > "$ARTIFACTS_DIR/.server-log" 2>&1 &
+      SERVER_PID=$!
+      echo "$SERVER_PID" > "$ARTIFACTS_DIR/.server-pid"
+
+      # 等待服务器就绪（最多 30 秒）
+      for i in $(seq 1 30); do
+        if curl -s "http://localhost:$PORT/api/health" > /dev/null 2>&1; then
+          echo "服务器已在端口 $PORT 就绪 (PID: $SERVER_PID)"
+          exit 0
+        fi
+        sleep 1
+      done
+
+      echo "警告: 服务器可能在 30 秒后仍未完全就绪（端口 $PORT, PID $SERVER_PID）"
+      echo "继续执行 — 复现节点将处理连接错误"
+    depends_on: [classify]
+    when: "$classify.output.needs_server == 'true'"
+    timeout: 45000
+
+  - id: reproduce
+    prompt: |
+      你是问题复现专家。你的任务是复现所报告的问题并捕获证据（截图、命令输出、错误消息）。
+
+      ## 问题上下文
+      - **领域**：$classify.output.area
+      - **类型**：$classify.output.type
+      - **标题**：$classify.output.title
+      - **复现提示**：$classify.output.repro_hint
+
+      ## 调查发现
+      $investigate.output
+
+      ## 服务器信息
+      如果已启动服务器，从以下位置读取端口：`cat "$ARTIFACTS_DIR/.server-port"`
+      如果文件不存在，则没有正在运行的服务器（该领域不需要服务器）。
+
+      ---
+
+      ## 复现操作手册
+
+      按照与问题领域匹配的操作手册执行。将所有证据捕获到 `$ARTIFACTS_DIR/`。
+
+      ### web-ui
+      1. 读取服务器端口：`PORT=$(cat "$ARTIFACTS_DIR/.server-port" | tr -d '\n')`
+      2. 打开应用：`agent-browser open http://localhost:$PORT`
+      3. 截取基准截图：`agent-browser screenshot "$ARTIFACTS_DIR/repro-01-baseline.png"`
+      4. 获取交互元素：`agent-browser snapshot -i`
+      5. 导航到与 issue 相关的区域（使用快照中的 @refs）
+      6. 执行 repro_hint 中描述的操作
+      7. 对每个重要状态截图：`agent-browser screenshot "$ARTIFACTS_DIR/repro-02-action.png"`
+      8. 如果出现错误，捕获它：`agent-browser get text @errorElement`
+      9. 检查浏览器控制台：`agent-browser console`
+      10. 检查 JS 错误：`agent-browser errors`
+      11. 最终截图：`agent-browser screenshot "$ARTIFACTS_DIR/repro-03-result.png"`
+      12. 关闭浏览器：`agent-browser close`
+
+      ### api-server
+      1. 读取服务器端口：`PORT=$(cat "$ARTIFACTS_DIR/.server-port" | tr -d '\n')`
+      2. 创建测试会话：`curl -s -X POST http://localhost:$PORT/api/conversations -H "Content-Type: application/json" -d '{}'`
+      3. 根据 repro_hint 请求有问题的端点
+      4. 捕获响应码和响应体：`curl -s -w "\nHTTP_CODE: %{http_code}\n" ...`
+      5. 对于 SSE 问题：`curl -s -N http://localhost:$PORT/api/stream/<id>`（10 秒后超时）
+      6. 检查服务器日志：`cat "$ARTIFACTS_DIR/.server-log" | tail -50`
+      7. 将所有 curl 输出保存到 `$ARTIFACTS_DIR/repro-api-responses.txt`
+
+      ### cli
+      1. 运行应触发问题的 CLI 命令
+      2. 分别捕获 stdout 和 stderr：
+         `bun run cli <command> > "$ARTIFACTS_DIR/repro-cli-stdout.txt" 2> "$ARTIFACTS_DIR/repro-cli-stderr.txt"; echo "EXIT_CODE: $?" >> "$ARTIFACTS_DIR/repro-cli-stdout.txt"`
+      3. 如果与工作流相关：`bun run cli workflow list --json > "$ARTIFACTS_DIR/repro-workflow-list.json" 2>&1`
+      4. 如果命令挂起，使用超时：`timeout 30 bun run cli <command>`
+      5. 检查输出中的错误消息
+
+      ### isolation
+      1. 检查当前状态：`bun run cli isolation list > "$ARTIFACTS_DIR/repro-isolation-list.txt" 2>&1`
+      2. 检查 git 工作树：`git worktree list > "$ARTIFACTS_DIR/repro-worktree-list.txt"`
+      3. 检查分支：`git branch -a > "$ARTIFACTS_DIR/repro-branches.txt"`
+      4. 尝试应该失败的操作（基于 repro_hint）
+      5. 捕获错误输出
+      6. 查询隔离数据库：`sqlite3 ~/.archon/archon.db "SELECT * FROM remote_agent_isolation_environments ORDER BY created_at DESC LIMIT 10" > "$ARTIFACTS_DIR/repro-isolation-db.txt" 2>&1`
+
+      ### workflows
+      1. 列出工作流：`bun run cli workflow list --json > "$ARTIFACTS_DIR/repro-workflow-list.json" 2>&1`
+      2. 如果提到了特定工作流，尝试运行它：
+         `bun run cli workflow run <name> --no-worktree "测试输入" > "$ARTIFACTS_DIR/repro-workflow-run.txt" 2>&1`
+      3. 如果是 YAML 解析问题，尝试直接加载定义
+      4. 检查执行输出中的错误消息
+
+      ### database
+      1. 检查数据库是否存在：`ls -la ~/.archon/archon.db 2>/dev/null`
+      2. 对受影响的表运行针对性查询：
+         - `sqlite3 ~/.archon/archon.db ".schema <table>" > "$ARTIFACTS_DIR/repro-db-schema.txt"`
+         - `sqlite3 ~/.archon/archon.db "SELECT COUNT(*) FROM <table>" > "$ARTIFACTS_DIR/repro-db-counts.txt"`
+      3. 检查 repro_hint 中描述的特定数据条件
+      4. 如果使用 PostgreSQL：改用 `psql $DATABASE_URL -c "..."`
+
+      ### adapters
+      1. 读取服务器端口：`PORT=$(cat "$ARTIFACTS_DIR/.server-port" | tr -d '\n')`
+      2. 检查适配器配置：查看 `.env` 中的相关环境变量
+      3. 检查服务器启动日志：`cat "$ARTIFACTS_DIR/.server-log" | grep -i "adapter\|slack\|telegram\|github\|discord" | head -20`
+      4. 如果适配器初始化失败，捕获错误
+      5. 通过 Web API 作为代理测试消息路由：
+         `curl -s -X POST http://localhost:$PORT/api/conversations/<id>/message -H "Content-Type: application/json" -d '{"message":"/status"}'`
+
+      ### core
+      1. 读取服务器端口：`PORT=$(cat "$ARTIFACTS_DIR/.server-port" | tr -d '\n')`
+      2. 创建会话：`curl -s -X POST http://localhost:$PORT/api/conversations -H "Content-Type: application/json" -d '{}'`
+      3. 发送触发问题的消息：
+         `curl -s -X POST http://localhost:$PORT/api/conversations/<id>/message -H "Content-Type: application/json" -d '{"message":"<repro_hint>"}'`
+      4. 轮询响应：`curl -s http://localhost:$PORT/api/conversations/<id>/messages`
+      5. 检查数据库中的会话状态：`sqlite3 ~/.archon/archon.db "SELECT * FROM remote_agent_sessions WHERE conversation_id='<id>'" 2>/dev/null`
+      6. 检查服务器日志：`cat "$ARTIFACTS_DIR/.server-log" | tail -50`
+
+      ### other
+      1. 运行 `bun run validate` 检查是否有明显故障 — 捕获输出：
+         `bun run validate > "$ARTIFACTS_DIR/repro-validate.txt" 2>&1; echo "EXIT_CODE: $?" >> "$ARTIFACTS_DIR/repro-validate.txt"`
+      2. 在代码库中搜索 repro_hint 中的关键词：
+         - 使用 Grep/Glob 查找相关文件
+         - 检查最近的 git 日志以获取相关变更
+      3. 如果描述暗示是构建或配置问题：
+         - 检查 `package.json` 脚本、`tsconfig.json`、`.env.example`
+         - 尝试运行相关的构建/开发命令
+      4. 如果描述暗示是运行时问题：
+         - 启动服务器（如果 `.server-port` 文件存在）并尝试触发该行为
+         - 检查日志中的错误
+      5. 记录你尝试的所有操作，即使没有明确复现
+
+      ---
+
+      ## 输出
+
+      按照操作手册执行后，将调查结果写入 `$ARTIFACTS_DIR/reproduction-results.md`：
+
+      ```markdown
+      # 复现结果
+
+      ## 状态: [REPRODUCED | NOT_REPRODUCED | PARTIAL]
+
+      ## 已执行步骤
+      1. [步骤]
+      2. [步骤]
+
+      ## 预期行为
+      [应该发生什么]
+
+      ## 实际行为
+      [实际发生了什么 — 或 "无法触发所报告的行为"]
+
+      ## 证据文件
+      - `$ARTIFACTS_DIR/repro-*.png` — 截图（如果是 web-ui）
+      - `$ARTIFACTS_DIR/repro-*.txt` — 命令输出
+      - `$ARTIFACTS_DIR/repro-*.json` — 结构化数据
+
+      ## 环境信息
+      [操作系统、版本、相关配置]
+
+      ## 备注
+      [任何额外观察、疑似根本原因的细化]
+      ```
+
+      关键：状态行必须恰好是以下之一：REPRODUCED、NOT_REPRODUCED、PARTIAL。
+      此值将被下游 bash 节点读取以决定是否创建 issue。
+
+      即使你无法完全复现问题，也要记录你尝试了什么
+      以及观察到了什么。部分复现仍然是有价值的证据。
+    depends_on: [classify, git-context, investigate, start-server]
+    context: fresh
+    skills:
+      - agent-browser
+    trigger_rule: one_success
+    idle_timeout: 300000
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 5：清理 + 门控
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: cleanup-server
+    bash: |
+      SERVER_PID=$(cat "$ARTIFACTS_DIR/.server-pid" 2>/dev/null | tr -d '\n')
+      SERVER_PORT=$(cat "$ARTIFACTS_DIR/.server-port" 2>/dev/null | tr -d '\n')
+
+      if [ -z "$SERVER_PID" ]; then
+        echo "没有启动服务器 — 跳过清理"
+        exit 0
+      fi
+
+      echo "正在清理服务器 PID $SERVER_PID（端口 $SERVER_PORT）..."
+
+      # 通过 PID 终止（跨平台）
+      kill "$SERVER_PID" 2>/dev/null || taskkill //F //T //PID "$SERVER_PID" 2>/dev/null || true
+
+      # 通过端口终止（备用方案）
+      if [ -n "$SERVER_PORT" ]; then
+        fuser -k "$SERVER_PORT/tcp" 2>/dev/null || true
+        lsof -ti:"$SERVER_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
+        netstat -ano 2>/dev/null | grep ":$SERVER_PORT " | grep LISTENING | awk '{print $5}' | sort -u | while read pid; do
+          taskkill //F //T //PID "$pid" 2>/dev/null || true
+        done
+      fi
+
+      # 关闭所有 agent-browser 会话
+      agent-browser close 2>/dev/null || true
+
+      sleep 1
+      echo "清理完成"
+    depends_on: [reproduce]
+    trigger_rule: all_done
+
+  - id: check-reproduction
+    bash: |
+      # 从结果文件中读取复现状态
+      if [ ! -f "$ARTIFACTS_DIR/reproduction-results.md" ]; then
+        echo "NOT_REPRODUCED"
+        exit 0
+      fi
+
+      STATUS=$(grep -oE '(NOT_REPRODUCED|REPRODUCED|PARTIAL)' "$ARTIFACTS_DIR/reproduction-results.md" | head -1)
+
+      if [ -z "$STATUS" ]; then
+        echo "NOT_REPRODUCED"
+      else
+        echo "$STATUS"
+      fi
+    depends_on: [cleanup-server]
+    trigger_rule: all_done
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 6：根据复现结果分支
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report-failure
+    prompt: |
+      问题无法复现。向用户报告此情况，并提供可操作的详细信息。
+
+      ## 问题描述
+      - **标题**：$classify.output.title
+      - **领域**：$classify.output.area
+      - **类型**：$classify.output.type
+      - **复现提示**：$classify.output.repro_hint
+
+      ## 已尝试的操作
+      $reproduce.output
+
+      ## 调查发现
+      $investigate.output
+
+      ## 指令
+
+      向用户清晰报告：
+
+      1. **首先声明**："无法复现所报告的问题。未创建 GitHub issue。"
+
+      2. **总结已尝试的操作**：列出复现节点根据领域操作手册采取的具体步骤。
+         要具体 — "在端口 X 启动服务器，导航到 Y，点击了 Z — 没有出现错误。"
+
+      3. **分享发现**：包含调查中的相关发现（代码引用、近期变更、可疑区域）。
+
+      4. **建议后续步骤**：
+         - 请用户提供更具体的复现步骤
+         - 提及可能相关的环境因素（操作系统、浏览器、数据库状态、特定数据条件）
+         - 如果调查发现了可疑代码，将其作为线索提及
+         - 建议使用调试日志运行：`LOG_LEVEL=debug bun run dev`
+
+      5. **提供重试选项**："如果你能提供更具体的步骤，可以使用这些详细信息再次运行工作流。"
+
+      不要创建 GitHub issue。此节点的目的是向用户反馈，
+      以便他们提供更好的信息或手动调查。
+    depends_on: [check-reproduction]
+    when: "$check-reproduction.output == 'NOT_REPRODUCED'"
+    context: fresh
+
+  - id: draft-issue
+    prompt: |
+      你是一位技术文档撰写人员，正在起草 GitHub issue。将所有收集到的上下文
+      组装成清晰、结构良好的 issue 正文。
+
+      ## 分类
+      - **类型**：$classify.output.type
+      - **领域**：$classify.output.area
+      - **标题**：$classify.output.title
+
+      ## Issue 模板
+      如果找到了模板，使用最合适的模板作为结构：
+      $fetch-template.output
+
+      ## 重复检查结果
+      $dedup-check.output
+
+      ## 代码库调查
+      $investigate.output
+
+      ## 复现结果
+      $reproduce.output
+
+      ## 指令
+
+      1. **首先检查重复**：如果 dedup-check 发现了明确匹配的开放 issue，
+         在顶部醒目标注。仍然起草 issue，但添加备注说明它可能是 #XYZ 的重复。
+
+      2. **使用模板**：如果找到了适用于 bug 报告的模板，则使用它。用真实数据填写每个部分。
+
+      3. **结构**（如果没有模板）：
+         ```markdown
+         ## 问题描述
+         [清晰的 1-2 句描述]
+
+         ## 复现步骤
+         [来自复现结果的编号步骤]
+
+         ## 预期行为
+         [应该发生什么]
+
+         ## 实际行为
+         [实际发生了什么，附证据]
+
+         ## 环境信息
+         - OS: [来自 git-context]
+         - Bun: [版本]
+         - Node: [版本]
+         - 分支: [当前分支]
+
+         ## 相关代码
+         [来自调查的关键 file:line 引用]
+
+         ## 额外上下文
+         [截图、日志、数据库状态 — 引用 artifact 文件]
+         ```
+
+      4. **包含复现证据**：
+         - 如果是 REPRODUCED：包含完整步骤和所有证据
+         - 如果是 PARTIAL：包含观察到的内容，注明不完整的复现
+
+      5. **根据分类建议标签**：
+         - 领域标签：`area: web`、`area: cli`、`area: workflows` 等
+         - 类型标签：`bug`、`regression`、`performance` 等
+
+      6. 将完整的 issue 正文写入 `$ARTIFACTS_DIR/issue-draft.md`
+
+      7. 将一行建议标题写入 `$ARTIFACTS_DIR/.issue-title`
+
+      8. 将建议标签（逗号分隔）写入 `$ARTIFACTS_DIR/.issue-labels`
+    depends_on: [check-reproduction, fetch-template, dedup-check, investigate]
+    when: "$check-reproduction.output != 'NOT_REPRODUCED'"
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 7：创建 Issue
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-issue
+    prompt: |
+      使用起草的内容创建 GitHub issue。
+
+      ## 指令
+
+      1. 读取草稿：`cat "$ARTIFACTS_DIR/issue-draft.md"`
+      2. 读取标题：`cat "$ARTIFACTS_DIR/.issue-title"`
+      3. 读取建议标签：`cat "$ARTIFACTS_DIR/.issue-labels"`
+
+      4. 检查仓库中实际存在哪些标签：
+         ```bash
+         gh label list --json name -q '.[].name' | head -50
+         ```
+         只使用存在的标签。跳过任何不匹配的建议标签。
+
+      5. 创建 issue：
+         ```bash
+         gh issue create \
+           --title "$(cat "$ARTIFACTS_DIR/.issue-title")" \
+           --body-file "$ARTIFACTS_DIR/issue-draft.md" \
+           --label "label1,label2"
+         ```
+
+      6. 捕获结果：
+         ```bash
+         ISSUE_URL=$(gh issue list --limit 1 --json url -q '.[0].url')
+         echo "$ISSUE_URL" > "$ARTIFACTS_DIR/.issue-url"
+         ```
+
+      7. 向用户报告：
+         - Issue URL
+         - 标题
+         - 应用的标签
+         - 是否发现重复 issue
+         - 复现结果摘要（已复现/部分复现）
+    depends_on: [draft-issue]
+    context: fresh

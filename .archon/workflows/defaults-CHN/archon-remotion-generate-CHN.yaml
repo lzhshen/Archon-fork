@@ -1,0 +1,125 @@
+name: archon-remotion-generate-CHN
+description: |
+  使用场景：用户希望使用 AI 生成或修改 Remotion 视频合成。
+  触发词："创建视频"、"生成视频"、"remotion"、"制作动画"、"关于...的视频"、"动画"。
+  功能：AI 编写 Remotion React 代码 -> 渲染预览截图 -> 渲染完整视频 -> 总结输出结果。
+  前提条件：工作目录中需要有一个 Remotion 项目（src/index.ts、src/Root.tsx）。
+  可选：安装 remotion-best-practices 技能以获得更高质量的输出：
+        npx skills add remotion-dev/skills
+
+nodes:
+  # ── 第 0 层：检查项目结构 ──────────────────────────────────
+  - id: check-project
+    bash: |
+      if [ ! -f "src/index.ts" ] || [ ! -f "src/Root.tsx" ]; then
+        echo "ERROR: Not a Remotion project. Expected src/index.ts and src/Root.tsx."
+        echo "Run 'npx create-video@latest' first, then run this workflow from that directory."
+        exit 1
+      fi
+      echo "Remotion project detected."
+      npx remotion compositions src/index.ts 2>&1 | tail -5
+      echo ""
+      echo "PROJECT_READY"
+    timeout: 60000
+
+  # ── 第 1 层：生成合成代码 ────────────────────────────────
+  - id: generate
+    prompt: |
+      你正在一个 Remotion 视频项目中工作。项目根目录为当前目录。
+
+      请查找并阅读现有的合成文件，以了解项目结构。
+      查看 src/ 目录下的 Root.tsx 以及所有合成组件。
+
+      现在请创建或修改合成，以满足以下请求：
+
+      $ARGUMENTS
+
+      规则：
+      - 所有动画必须使用 useCurrentFrame() 和 interpolate()/spring()
+      - 禁止使用 CSS transitions、Math.random()、setTimeout 或 Date.now()
+      - 使用 AbsoluteFill 进行布局，使用 Sequence 进行场景时间控制
+      - 图片必须使用 'remotion' 中的 <Img> 组件（而非原生 <img>）
+      - 保持尺寸为 1920x1080，帧率为 30 fps，除非用户另有指定
+      - 如果修改了 props，请同步更新 Root.tsx 中的 Zod schema 和 defaultProps
+      - 宽度/高度必须使用偶数（MP4 格式要求）
+      - 插值必须始终添加约束：extrapolateLeft: 'clamp', extrapolateRight: 'clamp'
+
+      编写完代码后，请重新阅读以验证代码是否正确。
+    depends_on: [check-project]
+    skills:
+      - remotion-best-practices
+    allowed_tools:
+      - Read
+      - Write
+      - Edit
+      - Glob
+
+  # ── 第 2 层：渲染预览截图 ────────────────────────────────
+  - id: render-preview
+    bash: |
+      mkdir -p out
+      COMP_ID=$(npx remotion compositions src/index.ts 2>&1 | grep -E '^\S' | head -1 | awk '{print $1}')
+      if [ -z "$COMP_ID" ]; then
+        echo "RENDER_FAILED: Could not detect composition ID"
+        exit 1
+      fi
+      echo "Composition: $COMP_ID"
+
+      DURATION=$(npx remotion compositions src/index.ts 2>&1 | grep -E '^\S' | head -1 | awk '{print $4}')
+      MID_FRAME=$(( ${DURATION:-150} / 2 ))
+      LATE_FRAME=$(( ${DURATION:-150} * 3 / 4 ))
+
+      echo "Rendering preview stills at frames 1, $MID_FRAME, $LATE_FRAME..."
+      npx remotion still src/index.ts "$COMP_ID" out/preview-early.png --frame=1 2>&1 | tail -2
+      npx remotion still src/index.ts "$COMP_ID" out/preview-mid.png --frame=$MID_FRAME 2>&1 | tail -2
+      npx remotion still src/index.ts "$COMP_ID" out/preview-late.png --frame=$LATE_FRAME 2>&1 | tail -2
+      RESULT=$?
+
+      if [ $RESULT -eq 0 ]; then
+        echo ""
+        echo "RENDER_SUCCESS"
+        ls -la out/preview-*.png
+      else
+        echo "RENDER_FAILED"
+      fi
+    depends_on: [generate]
+    timeout: 120000
+
+  # ── 第 3 层：渲染完整视频 ────────────────────────────────
+  - id: render-video
+    bash: |
+      COMP_ID=$(npx remotion compositions src/index.ts 2>&1 | grep -E '^\S' | head -1 | awk '{print $1}')
+      echo "Rendering full video: $COMP_ID"
+      npx remotion render src/index.ts "$COMP_ID" out/video.mp4 --codec=h264 --crf=18 2>&1 | tail -10
+      RESULT=$?
+
+      if [ $RESULT -eq 0 ]; then
+        echo ""
+        echo "VIDEO_RENDER_SUCCESS"
+        ls -la out/video.mp4
+      else
+        echo "VIDEO_RENDER_FAILED"
+      fi
+    depends_on: [render-preview]
+    timeout: 300000
+
+  # ── 第 4 层：总结 ──────────────────────────────────────────
+  - id: summary
+    prompt: |
+      已生成并渲染了一个 Remotion 视频。
+
+      原始请求：$ARGUMENTS
+
+      预览渲染输出：$render-preview.output
+      视频渲染输出：$render-video.output
+
+      请阅读生成的合成代码和预览截图（out/preview-early.png、out/preview-mid.png、out/preview-late.png）以验证输出结果。
+
+      请总结以下内容：
+      1. 视频包含的内容（基于代码和截图）
+      2. 渲染是否成功
+      3. 输出文件的位置（out/video.mp4）
+    depends_on: [render-video]
+    allowed_tools:
+      - Read
+    model: haiku

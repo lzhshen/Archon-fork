@@ -1,0 +1,107 @@
+name: archon-issue-review-full-CHN
+description: |
+  适用场景：用户希望对 GitHub issue 进行完整、全面的修复 + 审查流水线。
+  触发词："full review"、"comprehensive fix"、"fix with full review"、"deep review"、"issue review full"。
+  不适用于：简单的 issue 修复（请改用 archon-fix-github-issue）、
+           关于 issue 的问题、CI 失败、PR 审查、一般性探索。
+
+  完整工作流：
+  1. 调查 issue -> 根因分析，实现方案
+  2. 实现修复 -> 代码变更，测试，创建 PR
+  3. 全面审查 -> 5 个并行代理，具备范围感知能力
+  4. 修复审查问题 -> 处理 CRITICAL/HIGH 级别的发现
+  5. 最终总结 -> 决策矩阵，后续建议
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 1：调查
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: investigate
+    command: archon-investigate-issue
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 2：实现
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: implement
+    command: archon-implement-issue
+    depends_on: [investigate]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 3：代码审查
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: verify-pr-base
+    bash: |
+      set -euo pipefail
+      EXPECTED="$BASE_BRANCH"
+      ACTUAL=$(gh pr view --json baseRefName -q '.baseRefName')
+      if [ "$ACTUAL" != "$EXPECTED" ]; then
+        PR_NUMBER=$(gh pr view --json number -q '.number')
+        echo "PR #$PR_NUMBER 基础分支不匹配：预期=$EXPECTED 实际=$ACTUAL — 正在重新设置目标分支" >&2
+        gh pr edit "$PR_NUMBER" --base "$EXPECTED"
+      else
+        echo "PR 基础分支已验证：$EXPECTED"
+      fi
+    depends_on: [implement]
+
+  - id: review-scope
+    command: archon-pr-review-scope
+    depends_on: [verify-pr-base]
+    context: fresh
+
+  - id: sync
+    command: archon-sync-pr-with-main
+    depends_on: [review-scope]
+    context: fresh
+
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 4：修复审查问题
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: implement-fixes
+    command: archon-implement-review-fixes
+    depends_on: [synthesize]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 5：最终总结
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: summary
+    command: archon-workflow-summary
+    depends_on: [implement-fixes]
+    context: fresh

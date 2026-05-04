@@ -1,0 +1,14 @@
+name: archon-resolve-conflicts-CHN
+description: |
+  适用场景：PR 存在需要解决的合并冲突。
+  触发词："resolve conflicts"、"fix merge conflicts"、"rebase this PR"、"resolve this"、
+            "fix conflicts"、"merge conflicts"、"rebase and fix"。
+  功能说明：拉取最新的基础分支 -> 分析冲突 -> 自动解决简单冲突 ->
+        为复杂冲突提供选项 -> 提交并推送解决方案。
+  不适用于：没有冲突的 PR、无冲突的常规变基操作、压缩提交。
+
+  此工作流通过分析冲突变更来帮助解决合并冲突，在意图明确时自动解决，并为复杂冲突提供处理选项。
+
+nodes:
+  - id: resolve
+    command: archon-resolve-merge-conflicts

@@ -1,0 +1,48 @@
+name: archon-comprehensive-pr-review-CHN
+description: |
+  使用场景：用户希望对拉取请求进行全面代码审查并自动修复问题。
+  触发词："review this PR"、"review PR #123"、"comprehensive review"、"full PR review"、
+          "review and fix"、"check this PR"、"code review"。
+  执行流程：将 PR 与主分支同步（必要时变基）-> 并行运行 5 个专项审查代理 ->
+            汇总审查发现 -> 自动修复严重/高优先级问题 -> 报告剩余问题。
+  不适用于：对 PR 的快速提问、检查 CI 状态、简单的"改了什么"查询。
+
+  此工作流会在 $ARTIFACTS_DIR/../reviews/pr-{number}/ 中生成审查产物，并在
+  GitHub PR 上发布全面的审查评论。
+
+nodes:
+  - id: scope
+    command: archon-pr-review-scope
+
+  - id: sync
+    command: archon-sync-pr-with-main
+    depends_on: [scope]
+
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [sync]
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [sync]
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [sync]
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [sync]
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [sync]
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+
+  - id: implement-fixes
+    command: archon-implement-review-fixes
+    depends_on: [synthesize]

@@ -1,0 +1,52 @@
+name: archon-test-loop-dag-CHN
+description: |
+  使用场景：用户明确说"test-loop-dag"或"run test-loop-dag"时使用。
+  重要提示：这是一个包含循环节点的 DAG 工作流，会迭代直到完成。
+  不适用于：一般测试问题或调试。
+  功能：初始化一个计数器，循环迭代直到达到 3，然后报告完成。
+
+nodes:
+  - id: setup
+    bash: |
+      echo "0" > .archon/test-loop-dag-counter.txt
+      echo "Counter initialized to 0"
+
+  - id: loop-counter
+    depends_on: [setup]
+    loop:
+      prompt: |
+        你正在测试 DAG 工作流中的循环节点功能。
+
+        ## 你的任务
+
+        1. 读取文件 `.archon/test-loop-dag-counter.txt`
+        2. 解析当前的计数器值
+        3. 将其加 1
+        4. 将新值写回文件
+        5. 报告当前迭代情况
+
+        ## 用户意图
+
+        $USER_MESSAGE
+
+        ## 完成条件
+
+        - 如果计数器达到 3 或更高，输出：<promise>COMPLETE</promise>
+        - 否则，只需报告进度并正常结束
+
+        ## 重要提示
+
+        保持简洁。只需执行任务并报告计数器值。
+      until: COMPLETE
+      max_iterations: 5
+      fresh_context: false
+
+  - id: report
+    depends_on: [loop-counter]
+    prompt: |
+      循环计数器测试已完成。循环节点的输出为：
+
+      $loop-counter.output
+
+      读取 `.archon/test-loop-dag-counter.txt` 并确认最终的计数器值。
+      报告："测试循环 DAG 已成功完成。最终计数器值：{value}"

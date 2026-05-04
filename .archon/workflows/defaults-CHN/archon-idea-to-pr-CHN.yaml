@@ -1,0 +1,150 @@
+name: archon-idea-to-pr-CHN
+description: |
+  使用场景：你有一个功能想法或描述，想要进行端到端的开发。
+  输入：自然语言的功能描述，或 PRD 文件路径
+  输出：可合并的 PR，已完成全面审查
+
+  完整工作流：
+  1. 结合代码库分析，创建全面的实施计划
+  2. 设置分支并提取范围限制
+  3. 验证计划的研究内容是否仍然有效
+  4. 实施所有任务，包含类型检查
+  5. 运行完整的验证套件
+  6. 使用模板创建 PR，标记为就绪
+  7. 全面代码审查（5 个并行审查代理，具备范围限制感知能力）
+  8. 汇总并修复审查发现的问题
+  9. 生成包含决策矩阵的最终总结 -> GitHub 评论 + 后续建议
+
+  不适用于：执行已有计划（请使用 archon-plan-to-pr）、快速修复、独立审查。
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 0：创建计划
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: create-plan
+    command: archon-create-plan
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 1：初始化设置
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: plan-setup
+    command: archon-plan-setup
+    depends_on: [create-plan]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 2：确认计划
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: confirm-plan
+    command: archon-confirm-plan
+    depends_on: [plan-setup]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 3：实施
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: implement-tasks
+    command: archon-implement-tasks
+    depends_on: [confirm-plan]
+    context: fresh
+    model: opus[1m]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 4：验证
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: validate
+    command: archon-validate
+    depends_on: [implement-tasks]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 5：完成 PR
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: finalize-pr
+    command: archon-finalize-pr
+    depends_on: [validate]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 6：代码审查
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: verify-pr-base
+    bash: |
+      set -euo pipefail
+      EXPECTED="$BASE_BRANCH"
+      ACTUAL=$(gh pr view --json baseRefName -q '.baseRefName')
+      if [ "$ACTUAL" != "$EXPECTED" ]; then
+        PR_NUMBER=$(gh pr view --json number -q '.number')
+        echo "PR #$PR_NUMBER 基础分支不匹配：预期=$EXPECTED 实际=$ACTUAL — 正在重新指定目标分支" >&2
+        gh pr edit "$PR_NUMBER" --base "$EXPECTED"
+      else
+        echo "PR 基础分支已验证：$EXPECTED"
+      fi
+    depends_on: [finalize-pr]
+
+  - id: review-scope
+    command: archon-pr-review-scope
+    depends_on: [verify-pr-base]
+    context: fresh
+
+  - id: sync
+    command: archon-sync-pr-with-main
+    depends_on: [review-scope]
+    context: fresh
+
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 7：修复审查问题
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: implement-fixes
+    command: archon-implement-review-fixes
+    depends_on: [synthesize]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 8：最终总结与后续跟进
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: workflow-summary
+    command: archon-workflow-summary
+    depends_on: [implement-fixes]
+    context: fresh

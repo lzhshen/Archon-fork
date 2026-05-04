@@ -1,0 +1,345 @@
+name: archon-adversarial-dev-CHN
+description: |
+  适用场景：用户希望使用对抗式开发从零构建完整应用程序。
+  触发词："adversarial dev"、"adversarial development"、"build with adversarial"、"gan dev"、
+            "adversarial build"、"build app adversarially"、"adversarial coding"。
+  功能：三角色 GAN 启发式开发——规划者创建包含冲刺的产品规格，然后状态机循环交替生成者（编写代码）
+        和评估者（攻击代码），采用严格的通过/失败阈值。评估者的职责是破坏生成者构建的代码。
+        如果任何标准的评分低于 7/10，冲刺将连同对抗性反馈一起退回给生成者。
+        达到最大重试次数后冲刺失败则停止。
+
+  不适用于：Bug 修复、PR 审查、现有代码重构、简单的一次性任务。
+
+  基于 Anthropic 的线束设计文章，用于长时间运行的应用程序开发。
+  将规划、构建和评估分离为独立角色，形成对抗张力。
+provider: claude
+model: sonnet
+
+nodes:
+  # ─── 阶段 1：规划 ───────────────────────────────────────────────
+  - id: plan
+    prompt: |
+      你是一位产品规划专家。你的任务是将简短的用户提示扩展为一份全面的产品规格说明。
+
+      ## 用户需求
+
+      $ARGUMENTS
+
+      ## 你的任务
+
+      使用 Write 工具将一份全面的产品规格说明写入文件 `$ARTIFACTS_DIR/spec.md`。
+
+      规格说明必须包含以下所有部分：
+
+      ### 1. 产品概述
+      产品的功能、目标用户、核心价值主张。
+
+      ### 2. 技术栈
+      具体的技术、框架和库。要有主见——做出明确的选择，而不是"一个现代框架"。
+      包含确切的包名和相关版本。
+
+      ### 3. 设计语言
+      视觉风格、具体的颜色十六进制代码、字体选择、组件模式、间距系统。
+
+      ### 4. 功能列表
+      按优先级组织的所有功能。要详尽。
+
+      ### 5. 冲刺计划
+      将功能拆分为 3-6 个冲刺，按依赖关系和重要性排序：
+      - **冲刺 1** 应建立基础（项目设置、核心数据模型、基本 UI 框架）
+      - 每个后续冲刺建立在前一个冲刺之上
+      - 清晰标注每个冲刺："冲刺 1：基础"、"冲刺 2：核心功能"等
+      - 列出每个冲刺的具体功能/交付物
+
+      要具体且有主见。规格越具体（确切的 API 路径、具体的颜色代码、命名的库），
+      生成者就能构建得越好，评估者也能测试得越好。
+
+      重要提示：使用 Write 工具将规格说明写入 `$ARTIFACTS_DIR/spec.md`。不要仅将其
+      作为对话文本输出。
+    allowed_tools: [Read, Write, Glob, Grep]
+
+  # ─── 阶段 2：工作区初始化 ───────────────────────────────────────
+  - id: init-workspace
+    depends_on: [plan]
+    bash: |
+      ARTIFACTS="$ARTIFACTS_DIR"
+
+      # 创建用于线束通信的目录结构
+      mkdir -p "$ARTIFACTS/contracts"
+      mkdir -p "$ARTIFACTS/feedback"
+      mkdir -p "$ARTIFACTS/app"
+
+      # 在 app 目录中初始化独立的 git 仓库
+      cd "$ARTIFACTS/app"
+      git init -q
+      git commit --allow-empty -m "Initial commit: adversarial-dev workspace" -q
+
+      # 从规格中提取冲刺数量（查找最大的"Sprint N"引用）
+      SPEC="$ARTIFACTS/spec.md"
+      SPRINT_COUNT=3
+      if [ -f "$SPEC" ]; then
+        FOUND=$(grep -ioE 'sprint\s+[0-9]+' "$SPEC" | grep -oE '[0-9]+' | sort -n | tail -1)
+        if [ -n "$FOUND" ] && [ "$FOUND" -ge 1 ] 2>/dev/null; then
+          SPRINT_COUNT=$FOUND
+        fi
+        if [ "$SPRINT_COUNT" -gt 10 ]; then
+          SPRINT_COUNT=10
+        fi
+      fi
+
+      # 写入初始状态机文件
+      cat > "$ARTIFACTS/state.json" << 'STATEEOF'
+      {
+        "phase": "negotiating",
+        "sprint": 1,
+        "totalSprints": SPRINT_COUNT_PLACEHOLDER,
+        "retry": 0,
+        "maxRetries": 3,
+        "passThreshold": 7,
+        "completedSprints": [],
+        "status": "running"
+      }
+      STATEEOF
+      STATE_TMP="$ARTIFACTS/state.json.tmp"
+      sed "s/SPRINT_COUNT_PLACEHOLDER/$SPRINT_COUNT/" "$ARTIFACTS/state.json" > "$STATE_TMP"
+      mv "$STATE_TMP" "$ARTIFACTS/state.json"
+
+      echo "{\"totalSprints\": $SPRINT_COUNT, \"appDir\": \"$ARTIFACTS/app\", \"artifactsDir\": \"$ARTIFACTS\"}"
+    timeout: 30000
+
+  # ─── 阶段 3：对抗式冲刺循环 ────────────────────────────────────
+  #
+  # 由 $ARTIFACTS_DIR/state.json 驱动的状态机
+  # 每次迭代扮演一个角色：协商者、生成者或评估者
+  # fresh_context 确保角色之间真正的分离
+  #
+  - id: adversarial-sprint
+    depends_on: [init-workspace]
+    idle_timeout: 600000
+    model: opus[1m]
+    loop:
+      prompt: |
+        # 对抗式开发——冲刺循环
+
+        你是一个 GAN 启发的对抗式开发系统的一部分，拥有三个独立角色。
+        每次迭代你扮演一个角色，由状态文件中的当前阶段决定。
+
+        ## 首先：读取状态
+
+        读取 `$ARTIFACTS_DIR/state.json` 以确定：
+        - `phase`——你本次迭代扮演的角色
+        - `sprint`——当前冲刺编号
+        - `totalSprints`——总冲刺数
+        - `retry`——当前重试次数（0 = 首次尝试）
+        - `maxRetries`——硬性失败前的最大重试次数（默认 3）
+        - `passThreshold`——通过所需的最低分数（默认 7）
+
+        然后读取 `$ARTIFACTS_DIR/spec.md` 获取产品上下文。
+
+        ## 目录布局
+
+        - 应用源代码：`$ARTIFACTS_DIR/app/`
+        - 冲刺合约：`$ARTIFACTS_DIR/contracts/sprint-{N}.json`
+        - 评估反馈：`$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`
+        - 状态机：`$ARTIFACTS_DIR/state.json`
+
+        ---
+
+        ## 角色：合约协商者（phase = "negotiating"）
+
+        你为当前冲刺协商成功标准。按顺序扮演双方：
+
+        **第一步——生成者的提案：**
+        仔细阅读规格说明。根据冲刺计划确定冲刺 {N} 应该交付什么。
+        提出包含 5-15 个具体、可测试标准的冲刺合约。
+
+        每个标准必须是具体且可验证的。示例：
+        - 好的："GET /api/tasks 返回 200 和 JSON 数组；每个元素包含 id（数字）、title（字符串）、status（字符串）、createdAt（ISO 日期）"
+        - 好的："点击添加任务按钮会打开一个模态框，包含标题输入框、优先级下拉菜单（低/中/高）和截止日期选择器"
+        - 差的："API 运行良好"
+        - 差的："任务可以被管理"
+
+        **第二步——评估者的收紧：**
+        现在以对手的身份审查你的提案。对每个标准追问：
+        - 它是否足够具体以进行程序化测试？
+        - 遗漏了哪些边界情况？（空输入、特殊字符、并发请求）
+        - 标准是否足够高，还是粗糙的代码也能通过？
+
+        收紧模糊的标准。添加边界情况。提高标准。
+
+        **将最终合约写入** `$ARTIFACTS_DIR/contracts/sprint-{N}.json`：
+        ```json
+        {
+          "sprintNumber": <N>,
+          "features": ["功能1", "功能2", ...],
+          "criteria": [
+            {
+              "name": "short-kebab-name",
+              "description": "必须满足的具体、可测试的描述",
+              "threshold": 7
+            }
+          ]
+        }
+        ```
+
+        **更新 state.json**：设置 `"phase": "building"`。保持其他所有字段不变。
+
+        ---
+
+        ## 角色：生成者（phase = "building"）
+
+        你是一名软件工程师。构建必须经受住对抗性评估者主动攻击的功能，
+        该评估者会试图破坏你的代码。
+
+        **读取以下文件：**
+        1. `$ARTIFACTS_DIR/spec.md`——完整的产品规格（设计语言、技术栈、所有功能）
+        2. `$ARTIFACTS_DIR/contracts/sprint-{N}.json`——你必须满足的合约
+        3. 如果 `retry` > 0：读取 `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R-1}.json`
+           获取评估者之前的反馈
+
+        **如果是重试（retry > 0）：**
+        仔细阅读反馈。每个失败的标准都必须解决。
+        - 如果分数接近（5-6）且呈上升趋势：改进你的方法
+        - 如果分数较低（1-4）或方法根本上有问题：转向新策略
+        - 解决每一个反馈项——评估者会检查
+        - 在提交前通过运行代码重新验证每个修复
+
+        **构建规则：**
+        - 所有代码放入 `$ARTIFACTS_DIR/app/`
+        - 一次构建一个功能，验证其工作，然后提交：
+          ```bash
+          cd $ARTIFACTS_DIR/app && git add -A && git commit -m "feat: 所构建内容的描述"
+          ```
+        - 根据需要安装依赖（npm/bun/pip 等）
+        - 测试你的代码——启动服务器、访问端点、验证 UI 渲染
+        - 思考评估者会攻击什么：边界情况、错误处理、输入验证
+        - 防御性构建——评估者的工作就是破坏你
+
+        **更新 state.json**：设置 `"phase": "evaluating"`。保持其他所有字段不变。
+
+        ---
+
+        ## 角色：评估者（phase = "evaluating"）
+
+        你是一个对抗性 QA 代理。你的使命是破坏生成者构建的代码。
+        你不是来帮忙的。你不是来慷慨的。你是一个攻击者。
+
+        **关键约束：**
+        - 你对源代码是只读的。绝对不要对 `$ARTIFACTS_DIR/app/` 中的文件使用 Write 或 Edit。
+        - 你可以使用 Bash 来运行应用程序、curl 端点、运行测试脚本、检查行为。
+        - 你必须在完成之前杀死你启动的所有后台进程（服务器、监听器）。
+          使用：`pkill -f "node\|bun\|python\|npm" 2>/dev/null || true`
+        - 你必须为合约中的每个标准评分。不能跳过。
+
+        **评分指南：**
+        - **9-10**：优秀。完美运行，包括合约未提及的边界情况。
+        - **7-8**：扎实。满足所述标准。最多只有细微的完善问题。
+        - **5-6**：部分。核心功能存在，但在重要的边界情况下失败或有 bug。
+        - **3-4**：薄弱。勉强能运行。存在重大缺陷。
+        - **1-2**：损坏。无法运行或未实现。
+
+        不要按曲线评分。不要给予有利的推断。7 分意味着"真正达到了标准"。
+        如果某项功能损坏，就说它损坏了。
+
+        **读取**：`$ARTIFACTS_DIR/contracts/sprint-{N}.json` 获取标准。
+
+        **对每个标准：**
+        1. 读取相关源代码
+        2. 运行应用程序（启动服务器、测试端点、检查渲染的 UI）
+        3. 尝试破坏它——无效输入、缺失字段、边界情况、错误处理缺陷
+        4. 诚实评分
+
+        **将评估写入** `$ARTIFACTS_DIR/feedback/sprint-{N}-round-{R}.json`：
+        ```json
+        {
+          "passed": <如果所有分数 >= passThreshold 则为 true，否则为 false>,
+          "scores": {
+            "criterion-name": <分数>,
+            ...
+          },
+          "feedback": [
+            {
+              "criterion": "criterion-name",
+              "score": <1-10>,
+              "details": "具体发现。包含文件路径、行号、确切的错误消息、失败的 curl 命令。"
+            }
+          ],
+          "overallSummary": "什么起作用了，什么没起作用，生成者必须修复什么。"
+        }
+        ```
+
+        **确定通过/失败**——`passed` 仅在每个分数 >= `passThreshold` 时才为 `true`。
+
+        **根据结果更新 state.json：**
+
+        **如果通过（所有标准 >= 阈值）：**
+        - 将当前冲刺编号添加到 `completedSprints` 数组
+        - 如果 `sprint` < `totalSprints`：设置 `"phase": "negotiating"`，将 `"sprint"` 加 1，设置 `"retry": 0`
+        - 如果 `sprint` == `totalSprints`：设置 `"phase": "complete"`，设置 `"status": "complete"`
+
+        **如果失败：**
+        - 如果 `retry` < `maxRetries`：设置 `"phase": "building"`，将 `"retry"` 加 1
+        - 如果 `retry` >= `maxRetries`：设置 `"phase": "failed"`，设置 `"status": "failed"`
+
+        **重要提示**：在完成之前杀死所有后台进程：
+        ```bash
+        pkill -f "node|bun|python|npm|next|vite|webpack" 2>/dev/null || true
+        ```
+
+        ---
+
+        ## 完成
+
+        更新 state.json 后，检查 `status` 字段：
+        - 如果 `"status": "complete"` → 所有冲刺通过！输出：`<promise>ALL_SPRINTS_COMPLETE</promise>`
+        - 如果 `"status": "failed"` → 冲刺在最大重试次数后失败。输出：`<promise>ALL_SPRINTS_COMPLETE</promise>`
+        - 如果 `"status": "running"` → 还有更多工作要做。不要输出任何完成信号。
+
+      until: ALL_SPRINTS_COMPLETE
+      max_iterations: 60
+      fresh_context: true
+      until_bash: |
+        grep -qE '"status"\s*:\s*"(complete|failed)"' "$ARTIFACTS_DIR/state.json"
+
+  # ─── 阶段 4：报告 ─────────────────────────────────────────────────
+  - id: report
+    depends_on: [adversarial-sprint]
+    trigger_rule: all_done
+    context: fresh
+    model: haiku
+    prompt: |
+      你是一名项目报告员。生成一份关于对抗式开发运行的全面总结报告。
+
+      ## 读取以下所有文件：
+      1. `$ARTIFACTS_DIR/state.json`——最终状态（告诉你成功/失败、冲刺数量）
+      2. `$ARTIFACTS_DIR/spec.md`——原始产品规格
+      3. `$ARTIFACTS_DIR/contracts/` 中的所有文件——冲刺合约（使用 Glob 查找）
+      4. `$ARTIFACTS_DIR/feedback/` 中的所有文件——评估结果（使用 Glob 查找）
+
+      ## 生成一份涵盖以下内容的报告：
+
+      ### 构建概要
+      - 构建了什么应用程序（来自规格说明）
+      - 最终状态：所有冲刺是否通过？还是在哪个冲刺失败了？
+      - 已完成冲刺数 vs 计划冲刺数
+
+      ### 每个冲刺的详细分析
+      对于每个已尝试的冲刺：
+      - 合约要求的内容（功能 + 关键标准）
+      - 需要了多少次尝试（重试次数）
+      - 每个标准的最终分数
+      - 推动重试和改进的关键反馈
+
+      ### 质量指标
+      - 所有最终轮次标准的平均分数
+      - 哪些标准需要最多的重试
+      - 对抗性评估者在哪些方面将质量推到了最高水平
+
+      ### 如何运行
+      - 应用程序代码位于：`$ARTIFACTS_DIR/app/`
+      - 包含技术栈和如何启动应用程序（来自规格说明）
+      - 包含任何设置步骤（安装依赖、环境变量等）
+
+      将此报告写入 `$ARTIFACTS_DIR/report.md` 并同时作为你的响应输出，
+      以便用户直接看到。
+    allowed_tools: [Read, Write, Glob, Grep]

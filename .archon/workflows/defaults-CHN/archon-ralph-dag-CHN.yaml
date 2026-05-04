@@ -1,0 +1,759 @@
+name: archon-ralph-dag-CHN
+description: |
+  适用场景：用户希望运行 Ralph 实现循环。
+  触发词："ralph"、"run ralph"、"ralph dag"、"run ralph dag"。
+
+  DAG 工作流，执行以下步骤：
+  1. 检测输入类型：已有的 prd.json、已有的 prd.md（需要生成故事）、或原始想法
+  2. 如有需要，生成 prd.md 和 prd.json（探索代码库，拆分为故事）
+  3. 验证 PRD 文件，读取项目上下文，安装依赖
+  4. 运行 Ralph 循环（每次迭代使用全新上下文），每次迭代实现一个故事
+  5. 创建 PR 并报告完成情况
+
+  接受：一个想法描述、一个已有 prd.md 的路径，或一个包含 prd.md + prd.json 的目录
+
+provider: claude
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # 节点 1：检测输入
+  # 判断用户提供了什么内容：完整 PRD、部分 PRD、或想法
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: detect-input
+    model: haiku
+    prompt: |
+      # 检测 Ralph 输入
+
+      **用户输入**：$ARGUMENTS
+
+      判断用户提供了什么内容，并准备 PRD 目录。请严格按以下步骤操作：
+
+      ## 步骤 1：检测工作树
+
+      运行 `git worktree list --porcelain` 检查你是否处于工作树中。
+      如果看到多个条目，则你处于工作树中。第一个条目（其 "branch" 未指向当前分支的条目）对应的路径即为**主仓库根目录**。请保存此路径——后续查找文件时会用到。
+
+      ## 步骤 2：分类输入
+
+      查看上面的用户输入，它属于以下三种情况之一：
+
+      **情况 A — Ralph 目录路径**（包含 `.archon/ralph/`）：
+      提取该目录。检查其中是否同时存在 `prd.json` 和 `prd.md`（先在本地查找，若在工作树中则在主仓库根目录中查找）。
+
+      **情况 B — 文件路径**（以 `.md` 结尾）：
+      这是一个外部 PRD 文件。按以下方式查找：
+      1. 直接使用该路径（相对于当前工作目录）
+      2. 尝试作为绝对路径
+      3. 若在工作树中，尝试相对于步骤 1 中的**主仓库根目录**
+      找到后，读取文件以确认它是一个 PRD。
+
+      **情况 C — 自由文本**：
+      不是文件路径——它是一个功能想法。
+
+      ## 步骤 3：自动发现已有的 Ralph PRD
+
+      如果输入未指向特定路径，检查 `.archon/ralph/` 中是否包含任何 `prd.json` 文件：
+      ```bash
+      find .archon/ralph -name "prd.json" -type f 2>/dev/null
+      ```
+
+      ## 步骤 4：根据分类执行操作
+
+      **如果是情况 A 且两个文件都存在** → 输出 `ready`（无需进一步操作）
+
+      **如果是情况 B（找到外部 PRD）**：
+      1. 从 PRD 文件名或标题派生一个 kebab-case 格式的 slug（例如 `workflow-lifecycle-overhaul`）
+      2. 创建 ralph 目录：`mkdir -p .archon/ralph/{slug}`
+      3. 将 PRD 内容复制到 `.archon/ralph/{slug}/prd.md`
+      4. 输出 `external_prd` 及新的 prd_dir
+
+      **如果是情况 C 或自动发现的 ralph 目录有 prd.md 但没有 prd.json** → 输出 `needs_generation`
+
+      ## 输出
+
+      你的最终输出必须恰好是一个 JSON 对象：
+      ```json
+      {"input_type": "ready|external_prd|needs_generation", "prd_dir": ".archon/ralph/{slug}"}
+      ```
+    output_format:
+      type: object
+      properties:
+        input_type:
+          type: string
+          enum: [ready, external_prd, needs_generation]
+        prd_dir:
+          type: string
+      required: [input_type, prd_dir]
+
+  # ═══════════════════════════════════════════════════════════════
+  # 节点 2：生成 PRD
+  # 场景 1：用户有想法 → 生成 prd.md 和 prd.json
+  # 场景 2：用户有 prd.md → 生成包含故事的 prd.json
+  # 如果 prd.json 已存在则跳过
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: generate-prd
+    depends_on: [detect-input]
+    when: "$detect-input.output.input_type != 'ready'"
+    command: archon-ralph-generate
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # 节点 3：验证与准备
+  # 查找 PRD 目录，读取所有状态文件，安装依赖，
+  # 验证环境已为实现做好准备。
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate-prd
+    depends_on: [detect-input, generate-prd]
+    trigger_rule: one_success
+    bash: |
+      set -e
+
+      # ── 1. 查找 PRD 目录（从 detect-input 传递）──────
+      PRD_DIR=$detect-input.output.prd_dir
+
+      # 如果 detect-input 未知 PRD 目录（从头生成），则自动发现
+      if [ -z "$PRD_DIR" ] || [ ! -f "$PRD_DIR/prd.json" ]; then
+        FOUND=$(find .archon/ralph -name "prd.json" -type f 2>/dev/null | head -1)
+        if [ -n "$FOUND" ]; then
+          PRD_DIR=$(dirname "$FOUND")
+        fi
+      fi
+
+      if [ -z "$PRD_DIR" ] || [ ! -f "$PRD_DIR/prd.json" ]; then
+        echo "错误：生成步骤后未找到 prd.json。"
+        echo "请检查 generate-prd 节点的输出以获取错误信息。"
+        exit 1
+      fi
+
+      if [ ! -f "$PRD_DIR/prd.md" ]; then
+        echo "错误：在 $PRD_DIR 中未找到 prd.md"
+        exit 1
+      fi
+
+      # ── 2. 安装依赖（工作树缺少 node_modules）──
+      if [ -f "bun.lock" ] || [ -f "bun.lockb" ]; then
+        echo "正在安装依赖 (bun)..."
+        bun install --frozen-lockfile 2>&1 | tail -3
+      elif [ -f "package-lock.json" ]; then
+        echo "正在安装依赖 (npm)..."
+        npm ci 2>&1 | tail -3
+      elif [ -f "yarn.lock" ]; then
+        echo "正在安装依赖 (yarn)..."
+        yarn install --frozen-lockfile 2>&1 | tail -3
+      elif [ -f "pnpm-lock.yaml" ]; then
+        echo "正在安装依赖 (pnpm)..."
+        pnpm install --frozen-lockfile 2>&1 | tail -3
+      fi
+
+      # ── 3. Git 状态 ─────────────────────────────────────────
+      echo "BRANCH=$(git branch --show-current)"
+      echo "GIT_ROOT=$(git rev-parse --show-toplevel)"
+
+      # ── 4. 输出 PRD 上下文 ─────────────────────────────────
+      echo "PRD_DIR=$PRD_DIR"
+      echo "=== PRD_JSON_START ==="
+      cat "$PRD_DIR/prd.json"
+      echo ""
+      echo "=== PRD_JSON_END ==="
+      echo "=== PRD_MD_START ==="
+      cat "$PRD_DIR/prd.md"
+      echo ""
+      echo "=== PRD_MD_END ==="
+      echo "=== PROGRESS_START ==="
+      if [ -f "$PRD_DIR/progress.txt" ]; then
+        cat "$PRD_DIR/progress.txt"
+      else
+        echo "(尚无进度)"
+      fi
+      echo ""
+      echo "=== PROGRESS_END ==="
+
+      # ── 5. 摘要 ────────────────────────────────────────────
+      TOTAL=$(grep -c '"passes"' "$PRD_DIR/prd.json" || true)
+      DONE=$(grep -c '"passes": true' "$PRD_DIR/prd.json" || true)
+      TOTAL=${TOTAL:-0}
+      DONE=${DONE:-0}
+      echo "STORIES_TOTAL=$TOTAL"
+      echo "STORIES_DONE=$DONE"
+      echo "STORIES_REMAINING=$(( TOTAL - DONE ))"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 节点 4：RALPH 实现循环
+  # 每次迭代使用全新上下文。从磁盘读取 PRD 状态。
+  # 每次迭代实现一个故事。提交前进行验证。
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: implement
+    depends_on: [validate-prd]
+    idle_timeout: 600000
+    model: opus[1m]
+    loop:
+      prompt: |
+        # Ralph 智能体 — 自主故事实现
+
+        你是一个全新会话中的自主编码智能体——你没有之前迭代的记忆。
+        你的任务：从磁盘读取状态，实现一个故事，验证，提交，更新跟踪文件，然后退出。
+
+        **黄金法则**：如果验证失败，先修复再提交。绝不提交有问题的代码。绝不跳过验证。
+
+        ---
+
+        ## 阶段 0：上下文 — 加载项目状态
+
+        上游准备节点生成了以下上下文：
+
+        $validate-prd.output
+
+        **用户消息**：$USER_MESSAGE
+
+        ---
+
+        ### 0.1 解析 PRD 目录
+
+        从上面的上下文中提取 `PRD_DIR=...` 那一行。这是包含你 PRD 文件的目录。
+        保存此路径——下面所有文件操作都会用到。
+
+        ### 0.2 读取当前状态（从磁盘读取，而非上面的上下文）
+
+        上面的上下文是循环开始前的快照。之前的迭代可能已经修改了文件。
+        **你必须从磁盘重新读取以获取当前状态：**
+
+        1. **读取 `{prd-dir}/progress.txt`** — 你与之前迭代的唯一联系
+           - 首先查看 `## Codebase Patterns` 部分，了解之前迭代的经验
+           - 查看最近的条目，了解需要避免的陷阱
+        2. **读取 `{prd-dir}/prd.json`** — 故事完成状态的唯一真实来源
+        3. **读取 `{prd-dir}/prd.md`** — 完整需求、技术模式、验收标准
+
+        ### 0.3 读取项目规则
+
+        ```bash
+        cat CLAUDE.md
+        ```
+
+        记录所有编码标准、模式和规则。严格遵守。
+
+        **阶段_0_检查点：**
+        - [ ] PRD 目录已识别
+        - [ ] progress.txt 已读取（或已确认不存在）
+        - [ ] prd.json 已读取 — 了解哪些故事通过/未通过
+        - [ ] prd.md 已读取 — 理解需求
+        - [ ] CLAUDE.md 规则已记录
+
+        ---
+
+        ## 阶段 1：选择 — 选取下一个故事
+
+        ### 1.1 查找符合条件的故事
+
+        从 `prd.json` 中找到**最高优先级**的故事，且满足：
+        - `passes` 为 `false`
+        - `dependsOn` 中的所有故事 `passes` 都为 `true`
+
+        **如果所有故事 `passes` 都为 `true`** → 跳到阶段 6（完成）。
+
+        **如果没有符合条件的故事**（所有剩余故事都被阻塞）：
+        ```
+        已阻塞：没有符合条件的故事。剩余故事及其阻塞项：
+        - {story-id}：被 {dep-id} 阻塞 (passes: false)
+        ```
+        正常结束。循环将在达到 max_iterations 时终止。
+
+        ### 1.2 公布选择
+
+        ```
+        ── 已选故事 ──────────────────────────────────
+        ID：{story-id}
+        标题：{story-title}
+        优先级：{priority}
+        依赖：{deps 或 "无"}
+
+        验收标准：
+        - {标准 1}
+        - {标准 2}
+        - ...
+        ────────────────────────────────────────────────────
+        ```
+
+        公布所选故事后，发出故事开始事件：
+        ```bash
+        bun run cli workflow event emit --run-id $WORKFLOW_ID --type ralph_story_started --data '{"story_id":"{story-id}","title":"{story-title}"}' || true
+        ```
+
+        **阶段_1_检查点：**
+        - [ ] 已找到符合条件的故事（或全部完成/全部被阻塞）
+        - [ ] 验收标准已理解
+        - [ ] 依赖已验证为完成
+
+        ---
+
+        ## 阶段 2：实现 — 编写故事代码
+
+        ### 2.1 编码前先探索
+
+        在编写任何代码之前：
+        1. 阅读你计划修改的所有文件——了解当前状态
+        2. 检查 progress.txt 中的 `## Codebase Patterns` 部分以获取已发现的模式
+        3. 在代码库中寻找类似的实现作为参考
+        4. 阅读 prd.json 中该故事的 `technicalNotes` 字段
+
+        ### 2.2 实现规则
+
+        **应该做：**
+        - 只实现选定的故事——每次迭代一个故事
+        - 严格遵循现有代码模式（命名、结构、导入、错误处理）
+        - 遵循 CLAUDE.md 中的项目编码标准
+        - 按验收标准要求编写或更新测试
+        - 保持变更最小化和聚焦
+
+        **不应该做：**
+        - 重构无关代码
+        - 添加验收标准之外的改进
+        - 修改未改动行的格式
+        - 无正当理由安装新依赖（需 prd.md 中的依据）
+        - 触摸与本故事无关的文件
+        - 过度工程——做满足标准的最简单的事情
+
+        ### 2.3 每次修改文件后验证类型
+
+        修改每个文件后，运行：
+        ```bash
+        bun run type-check
+        ```
+
+        **如果类型检查失败：**
+        1. 仔细阅读错误信息
+        2. 修复你代码中的类型问题
+        3. 重新运行类型检查
+        4. 在类型检查通过之前不要继续修改下一个文件
+
+        **阶段_2_检查点：**
+        - [ ] 只实现了选定的故事
+        - [ ] 每次文件修改后类型都能编译通过
+        - [ ] 测试已按需编写/更新
+        - [ ] 没有无关变更
+
+        ---
+
+        ## 阶段 3：验证 — 全面检验
+
+        ### 3.1 静态分析
+
+        ```bash
+        bun run type-check && bun run lint
+        ```
+
+        **必须零错误、零警告通过。**
+
+        **如果 lint 失败：**
+        1. 运行 `bun run lint:fix` 自动修复可修复的问题
+        2. 手动修复剩余问题
+        3. 重新运行 lint
+        4. 仅在干净时继续
+
+        ### 3.2 测试
+
+        ```bash
+        bun run test
+        ```
+
+        **所有测试必须通过。**
+
+        **如果测试失败：**
+        1. 阅读失败输出
+        2. 判断：是你的实现有 bug 还是预先存在的失败？
+        3. 如果是你的 bug → 修复实现（而非测试）
+        4. 如果是预先存在的 → 记录下来但不要修复无关测试
+        5. 重新运行测试
+        6. 重复直到全部通过
+
+        ### 3.3 格式检查
+
+        ```bash
+        bun run format:check
+        ```
+
+        **如果格式检查失败：**
+        ```bash
+        bun run format
+        ```
+
+        ### 3.4 验证验收标准
+
+        逐一检查故事中的每个验收标准：
+        - 你的实现是否满足它？
+        - 你能验证它吗（阅读代码、运行命令、检查文件）？
+
+        如果某个标准未满足，回到阶段 2 修复。
+
+        **阶段_3_检查点：**
+        - [ ] 类型检查通过
+        - [ ] Lint 通过（0 错误，0 警告）
+        - [ ] 所有测试通过
+        - [ ] 格式正确
+        - [ ] 每个验收标准都已验证
+
+        ---
+
+        ## 阶段 4：提交 — 保存变更
+
+        ### 4.1 只暂存你编辑的文件
+
+        只暂存你为本故事实际编辑的文件——绝不使用 `git add -A`、`git add .` 或 `git add -u`。按名称列出它们：
+
+        ```bash
+        git add path/to/file1 path/to/file2 ...
+        git status --porcelain  # 验证没有暂存 scratch/review/PR-body 文件
+        git diff --cached --stat
+        ```
+
+        **绝不暂存** scratch / review / PR-body 产物，即使它们出现在 `git status` 中：
+
+        - `.pr-body.md`、`pr-body.md`、`*.scratch.md`、`*.tmp.md`
+        - `review/`、仓库根目录的 `*-report.md`
+        - `$ARTIFACTS_DIR` 下的任何内容
+
+        验证只有预期文件被暂存。如果出现意外文件，在提交前先调查。
+
+        ### 4.2 编写提交消息
+
+        ```bash
+        git commit -m "$(cat <<'EOF'
+        feat: {story-title}
+
+        实现 PRD 中的 {story-id}。
+
+        变更：
+        - {变更 1}
+        - {变更 2}
+        - {变更 3}
+        EOF
+        )"
+        ```
+
+        **提交消息规则：**
+        - 前缀：`feat:` 表示功能，`fix:` 表示修复，`refactor:` 表示重构
+        - 标题：故事标题（而非 PRD 名称）
+        - 正文：列出实际所做的变更
+        - 不要包含 AI 署名
+
+        **阶段_4_检查点：**
+        - [ ] 只提交了预期文件
+        - [ ] 提交消息清晰准确
+        - [ ] 提交后工作目录干净
+
+        ---
+
+        ## 阶段 5：跟踪 — 更新进度文件
+
+        ### 5.1 更新 prd.json
+
+        为已完成的故事设置 `passes: true` 并添加备注：
+
+        ```json
+        {
+          "id": "{story-id}",
+          "passes": true,
+          "notes": "在第 {N} 次迭代中实现。文件：{列表}。"
+        }
+        ```
+
+        更新 prd.json 后，发出故事完成事件：
+        ```bash
+        bun run cli workflow event emit --run-id $WORKFLOW_ID --type ralph_story_completed --data '{"story_id":"{story-id}","title":"{story-title}"}' || true
+        ```
+
+        ### 5.2 更新 progress.txt
+
+        **追加**到 `{prd-dir}/progress.txt`：
+
+        ```
+        ## {ISO 日期} — {story-id}：{story-title}
+
+        **状态**：已通过
+        **修改的文件**：
+        - {文件1} — {修改内容}
+        - {文件2} — {修改内容}
+
+        **验收标准已验证**：
+        - [x] {标准 1}
+        - [x] {标准 2}
+
+        **经验教训**：
+        - {发现的模式}
+        - {遇到的陷阱}
+        - {与预期方法的偏差}
+
+        ---
+        ```
+
+        ### 5.3 更新代码库模式（如适用）
+
+        如果你发现了一个**可复用的模式**，未来的迭代应该知道，请将其**前置**到 progress.txt 顶部的 `## Codebase Patterns` 部分。
+
+        格式：
+        ```
+        ## Codebase Patterns
+
+        ### {模式名称}
+        - **位置**：`{file:lines}`
+        - **模式**：{描述}
+        - **示例**：`{代码片段}`
+        ```
+
+        如果 `## Codebase Patterns` 部分尚不存在，在文件顶部创建它。
+
+        **阶段_5_检查点：**
+        - [ ] prd.json 已更新为 `passes: true`
+        - [ ] progress.txt 已追加迭代详情
+        - [ ] 代码库模式已更新（如适用）
+
+        ---
+
+        ## 阶段 6：完成 — 检查所有故事
+
+        ### 6.1 重新读取 prd.json
+
+        ```bash
+        cat {prd-dir}/prd.json
+        ```
+
+        统计 `passes: false` 的故事数量。
+
+        ### 6.2 如果所有故事都通过
+
+        1. **推送分支：**
+           ```bash
+           git push -u origin HEAD
+           ```
+
+        2. **读取 PR 模板：**
+           在仓库中查找 PR 模板——检查 `.github/pull_request_template.md`、`.github/PULL_REQUEST_TEMPLATE.md` 和 `docs/pull_request_template.md`。读取其中存在的任何一个。
+
+           如果找到模板，使用本次实现的上下文填写**每个部分**。不要跳过部分或保留占位符——根据实际变更如实填写（摘要、架构、验证证据、安全性、兼容性、回滚方案等）。
+
+           如果未找到模板，编写一个包含以下内容的摘要：问题、变更内容、故事表格和验证证据。
+
+        3. **创建草稿 PR**，使用 `gh pr create --draft --base $BASE_BRANCH --title "feat: {PRD 功能名称}"`，以填写好的模板作为正文。正文使用 HEREDOC。
+
+        4. **输出完成信号：**
+           ```
+           <promise>COMPLETE</promise>
+           ```
+
+        ### 6.3 如果还有剩余故事
+
+        报告状态并正常结束：
+        ```
+        ── 迭代完成 ──────────────────────────────────
+        已完成故事：{story-id} — {story-title}
+        剩余故事：{count}
+        下一个符合条件的故事：{next-story-id} — {next-story-title}
+        ────────────────────────────────────────────────────
+        ```
+
+        循环引擎将使用全新上下文启动下一次迭代。
+
+        ---
+
+        ## 处理边缘情况
+
+        ### 验证反复失败
+        - 如果类型检查或测试在同一错误上失败 3 次以上，暂停一下
+        - 重新阅读验收标准——你可能误解了需求
+        - 检查故事是否太大（需要拆分）
+        - 在 progress.txt 中记录阻塞原因并结束本次迭代
+
+        ### 故事太大，一次迭代无法完成
+        - 实现满足最关键验收标准的最小可行子集
+        - 只有在所有标准都满足时才设置 `passes: true`
+        - 如果无法满足所有标准，保持 `passes: false` 并在 progress.txt 中记录已完成的部分
+        - 下一次迭代将继续完成
+
+        ### 预先存在的测试失败
+        - 如果测试在你的变更之前就已经失败，记录下来但不要修复无关代码
+        - 如果完整测试套件有预先存在的问题，只运行与你的变更相关的测试文件
+        - 在 progress.txt 中记录预先存在的失败
+
+        ### 依赖安装失败
+        - 检查 `bun.lock` 或等效文件是否存在
+        - 尝试不带 `--frozen-lockfile` 的 `bun install`
+        - 在 progress.txt 中记录此问题
+
+        ### 迭代开始时 Git 状态不干净
+        - 这不应该发生（全新工作树），但如果发生了：
+        - 运行 `git status` 了解哪些内容不干净
+        - 如果是上一次迭代失败留下的残留，提交或暂存
+        - 绝不静默丢弃变更
+
+        ### 被阻塞的故事 — 所有剩余故事都有未满足的依赖
+        - 在输出中报告依赖链
+        - 检查某个依赖是否被错误地保持为 `passes: false`
+        - 如果某个依赖应该是 `passes: true`（代码已存在且正常工作），修复 prd.json
+        - 否则，结束本次迭代——循环将在达到 max_iterations 时终止
+
+        ---
+
+        ## 文件格式参考
+
+        ### prd.json 模式
+
+        ```json
+        {
+          "feature": "功能名称",
+          "issueNumber": 123,
+          "userStories": [
+            {
+              "id": "US-001",
+              "title": "简短标题",
+              "description": "作为...，我想要...，以便...",
+              "acceptanceCriteria": ["标准 1", "标准 2"],
+              "technicalNotes": "实现提示",
+              "dependsOn": ["US-000"],
+              "priority": 1,
+              "passes": false,
+              "notes": ""
+            }
+          ]
+        }
+        ```
+
+        ### progress.txt 格式
+
+        ```
+        ## Codebase Patterns
+
+        ### {模式名称}
+        - 位置：`file:lines`
+        - 模式：描述
+        - 示例：`代码`
+
+        ---
+
+        ## {日期} — {story-id}：{标题}
+
+        **状态**：已通过
+        **修改的文件**：...
+        **验收标准已验证**：...
+        **经验教训**：...
+
+        ---
+        ```
+
+        ---
+
+        ## 成功标准
+
+        - **ONE_STORY**：每次迭代恰好实现一个故事
+        - **VALIDATED**：提交前类型检查 + lint + 测试 + 格式检查全部通过
+        - **COMMITTED**：变更已提交并附有清晰的消息
+        - **TRACKED**：prd.json 和 progress.txt 准确更新
+        - **PATTERNS_SHARED**：发现的模式已添加到 progress.txt 供未来迭代参考
+        - **NO_SCOPE_CREEP**：无无关变更、无重构、无"改进"
+      until: COMPLETE
+      max_iterations: 15
+      fresh_context: true
+
+  - id: verify-pr-base
+    bash: |
+      set -euo pipefail
+      EXPECTED="$BASE_BRANCH"
+      ACTUAL=$(gh pr view --json baseRefName -q '.baseRefName')
+      if [ "$ACTUAL" != "$EXPECTED" ]; then
+        PR_NUMBER=$(gh pr view --json number -q '.number')
+        echo "PR #$PR_NUMBER 的基础分支不匹配：预期=$EXPECTED 实际=$ACTUAL — 正在重新设置目标分支" >&2
+        gh pr edit "$PR_NUMBER" --base "$EXPECTED"
+      else
+        echo "PR 基础分支已验证：$EXPECTED"
+      fi
+    depends_on: [implement]
+
+  # ═══════════════════════════════════════════════════════════════
+  # 节点 5：完成报告
+  # 读取最终状态并生成摘要。
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    depends_on: [verify-pr-base]
+    prompt: |
+      # 完成报告
+
+      Ralph 实现循环已完成。生成一份完成报告。
+
+      ## 上下文
+
+      **循环输出（最后一次迭代）：**
+
+      $implement.output
+
+      **准备上下文：**
+
+      $validate-prd.output
+
+      ---
+
+      ## 指令
+
+      ### 1. 读取最终状态
+
+      从上面的准备上下文中提取 `PRD_DIR=...`。
+      从磁盘读取当前文件：
+
+      ```bash
+      cat {prd-dir}/prd.json
+      cat {prd-dir}/progress.txt
+      ```
+
+      ### 2. 收集 Git 信息
+
+      ```bash
+      git log --oneline --no-merges $(git merge-base HEAD $BASE_BRANCH)..HEAD
+      git diff --stat $(git merge-base HEAD $BASE_BRANCH)..HEAD
+      ```
+
+      ### 3. 检查 PR 状态
+
+      ```bash
+      gh pr view HEAD --json url,number,state 2>/dev/null || echo "未找到 PR"
+      ```
+
+      ### 4. 生成报告
+
+      按以下格式输出：
+
+      ```
+      ═══════════════════════════════════════════════════════
+      RALPH DAG — 完成报告
+      ═══════════════════════════════════════════════════════
+
+      功能：{prd.json 中的功能名称}
+      PRD：{prd-dir}
+      分支：{分支名称}
+      PR：{URL 或 "未创建"}
+
+      ── 故事 ─────────────────────────────────────────
+
+      | ID | 标题 | 状态 |
+      |----|------|------|
+      {prd.json 中每个故事一行}
+
+      合计：{N}/{M} 个故事通过
+
+      ── 提交 ─────────────────────────────────────────
+
+      {git log 输出}
+
+      ── 修改的文件 ─────────────────────────────────
+
+      {git diff --stat 输出}
+
+      ── 发现的模式 ─────────────────────────────
+
+      {来自 progress.txt 中的 ## Codebase Patterns，或"无"}
+
+      ═══════════════════════════════════════════════════════
+      ```
+
+      保持事实性。不加评论——只呈现数据。

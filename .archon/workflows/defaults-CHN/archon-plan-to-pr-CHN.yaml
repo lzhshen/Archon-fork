@@ -1,0 +1,140 @@
+name: archon-plan-to-pr-CHN
+description: |
+  适用场景：你已有现成的实施方案，想要端到端地执行它。
+  输入：方案文件路径（$ARTIFACTS_DIR/plan.md 或 .agents/plans/*.md）
+  输出：可供合并的 PR，附带完整的代码审查
+
+  完整流程：
+  1. 读取方案、创建分支、提取范围限制
+  2. 验证方案中的调研结论是否仍然有效
+  3. 实现所有任务（含类型检查）
+  4. 运行完整验证套件
+  5. 使用模板创建 PR，标记为就绪
+  6. 全面代码审查（5 个并行审查代理，具备范围限制感知）
+  7. 汇总审查发现并修复问题
+  8. 最终总结（含决策矩阵）-> GitHub 评论 + 后续建议
+
+  不适用于：从零开始创建方案（请使用 archon-idea-to-pr）、快速修复、独立审查。
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 1：初始化设置
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: plan-setup
+    command: archon-plan-setup
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 2：确认方案
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: confirm-plan
+    command: archon-confirm-plan
+    depends_on: [plan-setup]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 3：实现
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: implement-tasks
+    command: archon-implement-tasks
+    depends_on: [confirm-plan]
+    context: fresh
+    model: opus[1m]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 4：验证
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: validate
+    command: archon-validate
+    depends_on: [implement-tasks]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 5：完成 PR
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: finalize-pr
+    command: archon-finalize-pr
+    depends_on: [validate]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 6：代码审查
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: verify-pr-base
+    bash: |
+      set -euo pipefail
+      EXPECTED="$BASE_BRANCH"
+      ACTUAL=$(gh pr view --json baseRefName -q '.baseRefName')
+      if [ "$ACTUAL" != "$EXPECTED" ]; then
+        PR_NUMBER=$(gh pr view --json number -q '.number')
+        echo "PR #$PR_NUMBER 基础分支不匹配：预期=$EXPECTED 实际=$ACTUAL — 正在重新指定目标分支" >&2
+        gh pr edit "$PR_NUMBER" --base "$EXPECTED"
+      else
+        echo "PR 基础分支已验证：$EXPECTED"
+      fi
+    depends_on: [finalize-pr]
+
+  - id: review-scope
+    command: archon-pr-review-scope
+    depends_on: [verify-pr-base]
+    context: fresh
+
+  - id: sync
+    command: archon-sync-pr-with-main
+    depends_on: [review-scope]
+    context: fresh
+
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [sync]
+    context: fresh
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 7：修复审查发现的问题
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: implement-fixes
+    command: archon-implement-review-fixes
+    depends_on: [synthesize]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # 阶段 8：最终总结与后续建议
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: workflow-summary
+    command: archon-workflow-summary
+    depends_on: [implement-fixes]
+    context: fresh

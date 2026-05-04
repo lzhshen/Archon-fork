@@ -1,0 +1,373 @@
+name: archon-architect-CHN
+description: |
+  适用场景：用户希望进行架构扫描、复杂度降低或代码库健康改善。
+  触发词："architect"、"simplify codebase"、"reduce complexity"、"architectural sweep"、
+            "clean up architecture"、"codebase health"、"fix architecture"。
+  功能：扫描代码库指标 -> 以原则性视角分析架构 -> 规划有针对性的
+        简化方案 -> 通过自审循环（钩子）执行修复 -> 验证 -> 创建 PR。
+  不适用于：单文件修复、功能开发、缺陷修复、PR 审查。
+
+  DAG 工作流，展示逐节点钩子：
+  - PostToolUse 钩子创建有机质量循环（写入后检查 lint、自我审查）
+  - PreToolUse 钩子在修改前注入架构原则
+  - 不同节点具有不同的信任级别和引导策略
+
+provider: claude
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 1：度量
+  # 收集原始指标 — 文件大小、复杂度热点、依赖扇出
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: scan-metrics
+    bash: |
+      echo "=== 文件大小热点（前 30 个最大的源文件）==="
+      find . -name '*.ts' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' \
+        -exec wc -l {} + 2>/dev/null | sort -rn | head -30
+
+      echo ""
+      echo "=== 导入扇出（导入最多的文件）==="
+      for f in $(find . -name '*.ts' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*'); do
+        count=$(grep -c "^import " "$f" 2>/dev/null) || count=0
+        if [ "$count" -gt 8 ]; then
+          echo "$count imports: $f"
+        fi
+      done | sort -rn | head -20
+
+      echo ""
+      echo "=== 导出扇出（导出最多的文件）==="
+      for f in $(find . -name '*.ts' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*'); do
+        count=$(grep -c "^export " "$f" 2>/dev/null) || count=0
+        if [ "$count" -gt 5 ]; then
+          echo "$count exports: $f"
+        fi
+      done | sort -rn | head -20
+
+      echo ""
+      echo "=== 函数长度热点（超过 50 行的函数）==="
+      grep -rn "^\(export \)\?\(async \)\?function \|=> {$" \
+        --include='*.ts' --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist . 2>/dev/null \
+        | head -30
+
+      echo ""
+      echo "=== 类型安全缺口 ==="
+      echo "any 使用量："
+      grep -rn ": any\b\|as any\b" --include='*.ts' --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist . 2>/dev/null | wc -l
+      echo "eslint-disable 注释数："
+      grep -rn "eslint-disable" --include='*.ts' --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist . 2>/dev/null | wc -l
+    timeout: 60000
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 2：分析
+  # 以架构视角阅读热点文件
+  # 钩子在每次文件读取后注入评估标准
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: analyze
+    prompt: |
+      你是一位资深软件架构师，正在执行代码库健康评估。
+
+      ## 代码库指标
+
+      $scan-metrics.output
+
+      ## 用户关注点
+
+      $ARGUMENTS
+
+      ## 指令
+
+      1. 阅读上述指标中标记的前 10-15 个文件（最大、导入最多、导出最多）
+      2. 对于每个文件，根据阅读后注入的评估标准进行评估（你会看到它们）
+      3. 建立一个持续的架构关注点列表
+      4. 关注以下方面：
+         - 做了太多事情的模块（SRP 违规）
+         - 未体现其复杂度价值的抽象
+         - 应该合并的重复模式（三次法则）
+         - 上帝文件或上帝函数
+         - 抽象泄漏或层级间的紧耦合
+         - 死代码或未使用的导出
+      5. 暂不要提出修改建议 — 仅进行诊断
+
+      ## 输出
+
+      将结构化评估写入 $ARTIFACTS_DIR/architecture-assessment.md，包含：
+      - 概要总结（3-5 句话）
+      - 按影响排名的首要发现
+      - 每项发现：文件、问题所在、影响原因、预估工作量
+    depends_on: [scan-metrics]
+    context: fresh
+    denied_tools: [Write, Edit, Bash]
+    hooks:
+      PostToolUse:
+        - matcher: "Read"
+          response:
+            hookSpecificOutput:
+              hookEventName: PostToolUse
+              additionalContext: >
+                对于你刚刚读取的文件，评估：
+                (1) 单一职责 — 这个模块是否只做一件事？
+                (2) 认知负荷 — 一个新团队成员是否能在 5 分钟内理解它？
+                (3) 抽象价值 — 每个抽象是否都体现了其复杂度的价值，还是过早的抽象？
+                (4) 依赖方向 — 这个文件是否依赖于同级或更低层级的事物，而非更高层级？
+                将任何关注点添加到你的持续列表中。要具体 — 引用行范围和函数名。
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 3：规划
+  # 对变更进行优先级排序和范围界定 — 纯推理，不使用工具
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: plan
+    prompt: |
+      你正在规划有针对性的架构改进。
+
+      ## 评估结果
+
+      $analyze.output
+
+      ## 原则
+
+      - KISS：偏好简单直接而非巧妙花哨
+      - YAGNI：移除投机性抽象
+      - 三次法则：仅在模式出现 3 次以上时才提取
+      - 每项变更必须可独立回滚
+      - 不要将重构与行为变更混在一起
+      - 控制在一次能安全完成的范围内（最多 5-7 个文件）
+
+      ## 指令
+
+      1. 从评估中选出影响最大、风险最低的 3-5 项改进
+      2. 对于每项改进，编写精确计划：哪个文件、改什么、为什么
+      3. 排序使每项变更相互独立（变更之间不产生级联依赖）
+      4. 评估影响范围 — 有多少其他文件会受影响
+
+      ## 输出
+
+      将计划写成编号列表。具体说明要修改的确切代码。
+      保持简洁 — 实施节点将按字面意思遵循此计划。
+    depends_on: [analyze]
+    allowed_tools: [Read]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 4：执行
+  # 进行变更，钩子创建质量反馈循环
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: simplify
+    prompt: |
+      你正在实施有针对性的架构简化。
+
+      ## 计划
+
+      $plan.output
+
+      ## 规则
+
+      - 严格遵循计划 — 不要顺便添加你注意到的额外改进
+      - 每项变更必须保留现有行为（仅重构，无功能变更）
+      - 每次文件编辑后，你会被提示进行验证 — 遵循这些指示
+      - 如果某项变更比预期更困难，跳过它并继续下一步
+      - 将每个逻辑变更单独提交，附带清晰的提交消息
+
+      ## 指令
+
+      1. 按顺序执行计划中的每一项
+      2. 对于每一项：读取文件、进行变更、执行编辑后检查清单
+      3. 所有变更完成后，执行最终的 `git diff --stat` 以验证范围
+    depends_on: [plan]
+    context: fresh
+    hooks:
+      PreToolUse:
+        - matcher: "Write|Edit"
+          response:
+            hookSpecificOutput:
+              hookEventName: PreToolUse
+              additionalContext: >
+                写入之前：这个文件在你的计划中吗？如果不在，说明为什么你要
+                修改它。检查有多少文件从此模块导入 — 对被广泛导入的模块的
+                变更需要额外的审查。
+      PostToolUse:
+        - matcher: "Write|Edit"
+          response:
+            systemMessage: >
+              你刚刚修改了一个文件。在继续之前，立即执行以下操作：
+              1. 运行类型检查器以验证你的变更能编译通过
+              2. 重新读取你修改的文件 — 它是否真的更简单了，还是你只是把复杂度搬了个地方？
+              3. 用一句话说明为什么这个变更降低了复杂度。如果你无法证明其合理性，就回滚它。
+        - matcher: "Read"
+          response:
+            hookSpecificOutput:
+              hookEventName: PostToolUse
+              additionalContext: >
+                在修改此文件之前，考虑一下：你的变更是会减少还是增加
+                读者需要在脑海中保持的概念数量？
+        - matcher: "Bash"
+          response:
+            hookSpecificOutput:
+              hookEventName: PostToolUse
+              additionalContext: >
+                检查退出码。如果命令失败，在尝试修复之前先诊断根本原因。
+                不要盲目重试。
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 5：验证
+  # 运行完整验证套件 — 仅 bash，不能编辑来"修复"失败
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    bash: |
+      echo "=== 类型检查 ==="
+      bun run type-check 2>&1
+      TC_EXIT=$?
+
+      echo ""
+      echo "=== 代码检查 ==="
+      bun run lint 2>&1
+      LINT_EXIT=$?
+
+      echo ""
+      echo "=== 测试 ==="
+      bun run test 2>&1
+      TEST_EXIT=$?
+
+      echo ""
+      echo "=== 结果 ==="
+      echo "类型检查: $([ $TC_EXIT -eq 0 ] && echo '通过' || echo '失败')"
+      echo "代码检查: $([ $LINT_EXIT -eq 0 ] && echo '通过' || echo '失败')"
+      echo "测试: $([ $TEST_EXIT -eq 0 ] && echo '通过' || echo '失败')"
+
+      # 始终以 0 退出，以便下游节点可以读取输出并决定
+      if [ $TC_EXIT -eq 0 ] && [ $LINT_EXIT -eq 0 ] && [ $TEST_EXIT -eq 0 ]; then
+        echo "VALIDATION_STATUS: PASS"
+      else
+        echo "VALIDATION_STATUS: FAIL"
+      fi
+    depends_on: [simplify]
+    timeout: 300000
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 6：修复验证失败（如有）
+  # 仅在验证失败时运行 — 专注修复，使用相同的质量钩子
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fix-failures
+    prompt: |
+      审查下面的验证输出。
+
+      ## 验证输出
+
+      $validate.output
+
+      ## 指令
+
+      如果输出以 "VALIDATION_STATUS: PASS" 结尾，回复
+      "所有检查已通过 — 无需修复。" 并停止。
+
+      如果存在失败：
+
+      1. 仔细阅读验证失败信息
+      2. 仅修复有问题的部分 — 不要做额外的改进
+      3. 如果修复需要改变行为（而不仅仅是修复类型/lint 错误），
+         则回滚原始变更
+      4. 每次修复后运行具体的失败检查以确认其通过
+      5. 所有修复完成后，运行完整验证套件：`bun run validate`
+    depends_on: [validate]
+    context: fresh
+    hooks:
+      PostToolUse:
+        - matcher: "Write|Edit"
+          response:
+            systemMessage: >
+              你刚刚做了一个修复。立即运行具体失败的验证检查
+              以验证你的修复有效。不要批量修复 — 逐一验证。
+      PreToolUse:
+        - matcher: "Write|Edit"
+          response:
+            hookSpecificOutput:
+              hookEventName: PreToolUse
+              additionalContext: >
+                你仅在修复验证失败。不要做任何超出通过失败检查
+                所需范围的变更。如有疑问，回滚导致失败的原始变更。
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 7：创建 PR
+  # 钩子确保此节点仅执行 git 操作
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      为架构改进创建一个拉取请求。
+
+      ## 上下文
+
+      - 架构评估：$analyze.output
+      - 计划：$plan.output
+      - 验证：$validate.output
+
+      ## 指令
+
+      1. 暂存所有变更并创建单个提交（或验证现有提交）
+      2. 推送分支：`git push -u origin HEAD`
+      3. 检查 PR 是否已存在：`gh pr list --head $(git branch --show-current)`
+      4. 创建以 `$BASE_BRANCH` 为目标分支的 PR：
+         `gh pr create --base $BASE_BRANCH --title "..." --body "..."`
+         - 标题：简明描述简化了什么（70 字符以内）
+         - 正文：使用以下格式
+      5. 将 PR URL 保存到 `$ARTIFACTS_DIR/.pr-url`
+
+      ## PR 正文格式
+
+      ```markdown
+      ## 架构扫描
+
+      **重点**：$ARGUMENTS
+
+      ### 评估
+
+      [来自架构评估的 3-5 句话总结]
+
+      ### 变更
+
+      [每项变更：哪个文件、简化了什么、为什么]
+
+      ### 验证
+
+      - [x] 类型检查通过
+      - [x] 代码检查通过
+      - [x] 测试通过
+      - [x] 每项变更保留现有行为
+      ```
+    depends_on: [fix-failures]
+    context: fresh
+    hooks:
+      PreToolUse:
+        - matcher: "Write|Edit"
+          response:
+            hookSpecificOutput:
+              hookEventName: PreToolUse
+              permissionDecision: deny
+              permissionDecisionReason: "PR 创建节点 — 不要修改源文件。仅使用 git 和 gh 命令。"
+      PostToolUse:
+        - matcher: "Bash"
+          response:
+            hookSpecificOutput:
+              hookEventName: PostToolUse
+              additionalContext: >
+                验证此命令是否成功。如果 git push 或 gh pr create 失败，
+                在重试之前仔细阅读错误消息。
+
+  - id: verify-pr-base
+    bash: |
+      set -euo pipefail
+      EXPECTED="$BASE_BRANCH"
+      ACTUAL=$(gh pr view --json baseRefName -q '.baseRefName')
+      if [ "$ACTUAL" != "$EXPECTED" ]; then
+        PR_NUMBER=$(gh pr view --json number -q '.number')
+        echo "PR #$PR_NUMBER 的目标分支不匹配：期望=$EXPECTED 实际=$ACTUAL — 正在重新设定目标" >&2
+        gh pr edit "$PR_NUMBER" --base "$EXPECTED"
+      else
+        echo "PR 目标分支已验证：$EXPECTED"
+      fi
+    depends_on: [create-pr]

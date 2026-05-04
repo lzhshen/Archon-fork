@@ -1,0 +1,135 @@
+name: archon-smart-pr-review-CHN
+description: |
+  适用场景：用户希望进行智能、高效的 PR 审查，并根据 PR 复杂度自适应调整。
+  触发词："smart review"、"review this PR"、"review PR #123"、"efficient review"、
+           "smart PR review"、"quick review"。
+  功能：收集 PR 范围 -> 分类复杂度 -> 仅路由到相关的审查代理 ->
+        综合分析结果 -> 自动修复 CRITICAL/HIGH 级别的问题。
+  不适用于：当你明确需要运行所有审查代理时（请改用 archon-comprehensive-pr-review）。
+
+  与全面审查不同，此工作流会先对 PR 进行分类，然后仅运行相关的审查代理。
+  一个 3 行的拼写修正会跳过测试覆盖率和文档影响检查。
+
+nodes:
+  - id: scope
+    command: archon-pr-review-scope
+
+  - id: sync
+    command: archon-sync-pr-with-main
+    depends_on: [scope]
+
+  - id: classify
+    prompt: |
+      你是一个 PR 复杂度分类器。分析下面的 PR 范围，确定应运行哪些审查代理。
+
+      ## PR 范围
+      $scope.output
+
+      ## 规则
+      - **代码审查**：除非差异为空或仅涉及非代码文件（例如仅 README、仅配置文件或仅 .yaml 变更），否则始终运行。
+      - **错误处理**：如果差异涉及包含 try/catch、错误处理、async/await 的代码，或添加了新的失败路径，则运行。
+      - **测试覆盖率**：如果差异涉及源代码（不仅是测试、文档或配置文件），则运行。
+      - **注释质量**：如果差异添加或修改了注释、文档字符串、JSDoc，或代码文件中的重要文档，则运行。
+      - **文档影响**：如果差异添加/删除/重命名了公共 API、命令、CLI 标志、环境变量或面向用户的功能，则运行。
+
+      对 PR 复杂度进行分类：
+      - **trivial**：拼写修正、格式调整、单行变更、版本号更新
+      - **small**：1-3 个文件，逻辑简单，无架构变更
+      - **medium**：4-10 个文件，中等程度的逻辑变更，存在部分横切关注点
+      - **large**：10 个以上文件，架构变更，新增子系统，复杂重构
+
+      请为每个决策提供推理依据。
+    depends_on: [scope]
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        run_code_review:
+          type: string
+          enum: ["true", "false"]
+        run_error_handling:
+          type: string
+          enum: ["true", "false"]
+        run_test_coverage:
+          type: string
+          enum: ["true", "false"]
+        run_comment_quality:
+          type: string
+          enum: ["true", "false"]
+        run_docs_impact:
+          type: string
+          enum: ["true", "false"]
+        complexity:
+          type: string
+          enum: ["trivial", "small", "medium", "large"]
+        reasoning:
+          type: string
+      required:
+        - run_code_review
+        - run_error_handling
+        - run_test_coverage
+        - run_comment_quality
+        - run_docs_impact
+        - complexity
+        - reasoning
+
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [classify, sync]
+    when: "$classify.output.run_code_review == 'true'"
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [classify, sync]
+    when: "$classify.output.run_error_handling == 'true'"
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [classify, sync]
+    when: "$classify.output.run_test_coverage == 'true'"
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [classify, sync]
+    when: "$classify.output.run_comment_quality == 'true'"
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [classify, sync]
+    when: "$classify.output.run_docs_impact == 'true'"
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+
+  - id: implement-fixes
+    command: archon-implement-review-fixes
+    depends_on: [synthesize]
+
+  # 可选：审查完成时发送推送通知。
+  # 如需启用，请创建 .archon/mcp/ntfy.json — 参见 docs/mcp-servers.md
+  - id: check-ntfy
+    bash: "test -f .archon/mcp/ntfy.json && echo 'true' || echo 'false'"
+    depends_on: [implement-fixes]
+
+  - id: notify
+    depends_on: [check-ntfy, synthesize, implement-fixes]
+    when: "$check-ntfy.output == 'true'"
+    trigger_rule: all_success
+    mcp: .archon/mcp/ntfy.json
+    allowed_tools: []
+    prompt: |
+      发送一条推送通知，总结 PR 审查结果。
+
+      审查综合报告：
+      $synthesize.output
+
+      修复结果：
+      $implement-fixes.output
+
+      发送要求：
+      - 标题："PR 审查完成"
+      - 消息：1-2 句话的摘要 — 结论和问题数量。简短到适合在锁屏界面显示。
+      - 优先级：如果可以合并则为 3，如果需要修复则为 4，如果存在严重问题则为 5

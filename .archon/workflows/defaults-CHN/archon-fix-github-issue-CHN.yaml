@@ -1,0 +1,331 @@
+name: archon-fix-github-issue-CHN
+description: |
+  适用场景：用户希望修复、解决或实现某个 GitHub issue 的解决方案。
+  触发词："修复这个问题"、"实现 issue #123"、"解决这个 bug"、"修复它"、
+          "修复 issue"、"解决 issue"、"修复 #123"。
+  不适用于：综合多代理审查（请使用 archon-issue-review-full）、
+           关于 issue 的提问、CI 失败、PR 审查、一般性探索。
+
+  DAG 工作流程如下：
+  1. 对 issue 进行分类（bug/feature/enhancement 等）
+  2. 研究上下文（网络研究 + 通过 investigate/plan 探索代码库）
+  3. 根据分类结果路由到 investigate（bug）或 plan（功能）
+  4. 实现修复/功能并进行验证
+  5. 使用仓库的 PR 模板创建草稿 PR
+  6. 运行智能审查（始终执行代码审查 + CLAUDE.md 检查，按需运行额外代理）
+  7. 积极自修复所有发现的问题（测试、文档、错误处理）
+  8. 简化已更改的代码（直接实现修复，而非仅报告问题）
+  9. 将结果报告回 GitHub issue 并提供后续建议
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 1：获取与分类
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-number
+    prompt: |
+      找到此请求对应的 GitHub issue 编号。
+
+      请求：$ARGUMENTS
+
+      规则：
+      - 如果消息包含明确的 issue 编号（例如 "#709"、"issue 709"、"709"），提取该编号。
+      - 如果消息存在歧义（例如 "修复 SQLite 时间戳 bug"），使用 `gh issue list` 搜索匹配的 issue 并选择最佳匹配。
+
+      关键要求：最终输出必须仅为纯数字，不含引号、不含 markdown、不含解释。正确输出示例：709
+
+  - id: fetch-issue
+    bash: |
+      # 去除 AI 输出中的引号、空格和 markdown 反引号
+      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "无法从以下内容提取 issue 编号: $extract-issue-number.output" >&2
+        exit 1
+      fi
+      gh issue view "$ISSUE_NUM" --json title,body,labels,comments,state,url,author
+    depends_on: [extract-issue-number]
+
+  - id: classify
+    prompt: |
+      你是一个 issue 分类器。分析下方的 GitHub issue 并确定其类型。
+
+      ## Issue 内容
+
+      $fetch-issue.output
+
+      ## 分类规则
+
+      | 类型 | 指标 |
+      |------|------|
+      | bug | "broken"、"error"、"crash"、"doesn't work"、堆栈跟踪、回归 |
+      | feature | "add"、"new"、"support"、"would be nice"、全新功能 |
+      | enhancement | "improve"、"better"、"update existing"、"extend"、渐进式改进 |
+      | refactor | "clean up"、"simplify"、"reorganize"、"restructure" |
+      | chore | "update deps"、"upgrade"、"maintenance"、"CI/CD" |
+      | documentation | "docs"、"readme"、"clarify"、"examples" |
+
+      请提供你的分类理由。
+    depends_on: [fetch-issue]
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        issue_type:
+          type: string
+          enum: ["bug", "feature", "enhancement", "refactor", "chore", "documentation"]
+        title:
+          type: string
+        reasoning:
+          type: string
+      required: [issue_type, title, reasoning]
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 2：研究（与 PR 模板获取并行）
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: web-research
+    command: archon-web-research
+    depends_on: [classify]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 3：调查（bug）/ 规划（功能）
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: investigate
+    command: archon-investigate-issue
+    depends_on: [classify, web-research]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+
+  - id: plan
+    command: archon-create-plan
+    depends_on: [classify, web-research]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+
+  # 桥接：确保 investigation.md 存在以供实现步骤使用
+  # archon-fix-issue 从 $ARTIFACTS_DIR/investigation.md 读取
+  # archon-create-plan 写入 $ARTIFACTS_DIR/plan.md
+  # 当走规划路径时，此节点将 plan.md 复制为 investigation.md
+  - id: bridge-artifacts
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/plan.md" ] && [ ! -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        cp "$ARTIFACTS_DIR/plan.md" "$ARTIFACTS_DIR/investigation.md"
+        echo "已将 plan.md 桥接为 investigation.md 以供实现步骤使用"
+      elif [ -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "investigation.md 已存在于调查步骤中"
+      else
+        echo "警告：未找到 investigation.md 或 plan.md — 实现步骤可能失败"
+      fi
+    depends_on: [investigate, plan]
+    trigger_rule: one_success
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 4：实现
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: implement
+    command: archon-fix-issue
+    depends_on: [bridge-artifacts]
+    context: fresh
+    model: opus[1m]
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 5：验证
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    command: archon-validate
+    depends_on: [implement]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 6：创建草稿 PR
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      为当前分支创建一个草稿拉取请求。
+
+      ## 上下文
+
+      - **Issue**：$ARGUMENTS
+      - **分类结果**：$classify.output
+      - **Issue 标题**：$classify.output.title
+
+      ## 操作步骤
+
+      1. 检查 git 状态。如果存在未提交的更改，仅暂存和提交属于修复的源文件：
+         - 使用 `git add <path1> <path2> ...` 逐个列出文件名 — 禁止使用 `git add -A`、`git add .` 或 `git add -u`
+         - **禁止提交**临时/审查/PR 正文文件，即使它们出现在 `git status` 中：
+           - 任何路径下的 `.pr-body.md`、`pr-body.md`、`*.scratch.md`、`*.tmp.md`
+           - 仓库根目录下的 `review/`、`*-report.md`
+           - `$ARTIFACTS_DIR` 下的任何文件
+         - 在提交前使用 `git status --porcelain` 验证没有临时文件被暂存
+         - 如果出现不属于修复的已修改或未跟踪文件，请忽略它们
+      2. 推送分支：`git push -u origin HEAD`
+      3. 从 `$ARTIFACTS_DIR/` 读取实现产物作为上下文：
+         - `$ARTIFACTS_DIR/investigation.md` 或 `$ARTIFACTS_DIR/plan.md`
+         - `$ARTIFACTS_DIR/implementation.md`
+         - `$ARTIFACTS_DIR/validation.md`
+      4. 检查该分支是否已存在 PR：`gh pr list --head $(git branch --show-current)`
+         - 如果 PR 已存在，跳过创建并记录其编号
+      5. 查找项目的 PR 模板，路径为 `.github/pull_request_template.md`、`.github/PULL_REQUEST_TEMPLATE.md` 或 `docs/PULL_REQUEST_TEMPLATE.md`。读取找到的模板。
+      6. 创建草稿 PR：`gh pr create --draft --base $BASE_BRANCH`
+         - 标题：简洁、祈使语气、不超过 70 个字符
+         - 正文：如果找到 PR 模板，用产物中的详细信息填写**每个章节**。不要跳过章节或留占位符。如果没有模板，撰写包含摘要、变更内容、验证证据和 `Fixes #...` 的正文。
+         - **PR 正文文件位置**：如果将正文写入文件（例如用于 `--body-file`），文件必须位于 `$ARTIFACTS_DIR/pr-body.md` 或 `/tmp/` 下 — 禁止放在工作区内。仓库根目录下的 `.pr-body.md` 等文件会被后续提交拾取。
+         - 关联 issue：包含 `Fixes #...` 或 `Closes #...`
+      7. 记录 PR 标识：
+         ```bash
+         PR_NUMBER=$(gh pr view --json number -q '.number')
+         echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+         PR_URL=$(gh pr view --json url -q '.url')
+         echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
+         ```
+    depends_on: [validate]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 7：审查
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: verify-pr-base
+    bash: |
+      set -euo pipefail
+      EXPECTED="$BASE_BRANCH"
+      ACTUAL=$(gh pr view --json baseRefName -q '.baseRefName')
+      if [ "$ACTUAL" != "$EXPECTED" ]; then
+        PR_NUMBER=$(gh pr view --json number -q '.number')
+        echo "PR #$PR_NUMBER 基础分支不匹配：预期=$EXPECTED 实际=$ACTUAL — 正在重新指向" >&2
+        gh pr edit "$PR_NUMBER" --base "$EXPECTED"
+      else
+        echo "PR 基础分支已验证：$EXPECTED"
+      fi
+    depends_on: [create-pr]
+
+  - id: review-scope
+    command: archon-pr-review-scope
+    depends_on: [verify-pr-base]
+    context: fresh
+
+  - id: review-classify
+    prompt: |
+      你是一个 PR 审查分类器。分析 PR 的范围并确定应运行哪些审查代理。
+
+      ## PR 范围
+
+      $review-scope.output
+
+      ## 规则
+
+      - **代码审查**：始终运行。每个 PR 都必须执行。同时检查
+        PR 是否符合 CLAUDE.md 规则和项目规范。
+      - **错误处理**：如果变更涉及 try/catch、错误处理、
+        async/await，或添加了新的失败路径，则运行。
+      - **测试覆盖率**：如果变更涉及源代码（不仅是测试、文档或配置），则运行。
+      - **注释质量**：如果变更添加或修改了注释、文档字符串、JSDoc，
+        或代码文件中的重要文档，则运行。
+      - **文档影响**：如果变更添加/删除/重命名了公共 API、命令、CLI 标志、
+        环境变量或面向用户的功能，则运行。
+
+      请为每项决定提供理由。
+    depends_on: [review-scope]
+    model: haiku
+    allowed_tools: []
+    context: fresh
+    output_format:
+      type: object
+      properties:
+        run_code_review:
+          type: string
+          enum: ["true", "false"]
+        run_error_handling:
+          type: string
+          enum: ["true", "false"]
+        run_test_coverage:
+          type: string
+          enum: ["true", "false"]
+        run_comment_quality:
+          type: string
+          enum: ["true", "false"]
+        run_docs_impact:
+          type: string
+          enum: ["true", "false"]
+        reasoning:
+          type: string
+      required:
+        - run_code_review
+        - run_error_handling
+        - run_test_coverage
+        - run_comment_quality
+        - run_docs_impact
+        - reasoning
+
+  # 代码审查始终运行 — 必须执行
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [review-classify]
+    context: fresh
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_error_handling == 'true'"
+    context: fresh
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_test_coverage == 'true'"
+    context: fresh
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_comment_quality == 'true'"
+    context: fresh
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_docs_impact == 'true'"
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 8：综合与自修复
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+    context: fresh
+
+  - id: self-fix
+    command: archon-self-fix-all
+    depends_on: [synthesize]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 9：简化
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: simplify
+    command: archon-simplify-changes
+    depends_on: [self-fix]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 10：报告
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    command: archon-issue-completion-report
+    depends_on: [simplify]
+    context: fresh
