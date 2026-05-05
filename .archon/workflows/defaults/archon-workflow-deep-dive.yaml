@@ -1,0 +1,376 @@
+name: archon-workflow-deep-dive
+description: |
+  Use when: User wants to analyze an Archon workflow and generate a visual deep-dive document.
+  Triggers: "workflow deep dive", "analyze workflow", "inspect workflow run",
+            "workflow visualization", "workflow static analysis", "workflow dynamic analysis".
+  Does: Resolves a target workflow -> performs static structure analysis -> optionally reads an existing run by explicit run_id -> inspects events and artifacts -> generates a deep-dive Markdown document.
+  NOT for: Executing the target workflow, debugging arbitrary code outside workflow analysis, or inferring dynamic behavior without either a supplied run_id or static evidence.
+
+provider: claude
+model: sonnet
+mutates_checkout: false
+worktree:
+  enabled: false
+
+nodes:
+  - id: resolve-target
+    prompt: |
+      You are a workflow analysis request parser.
+
+      Parse the user's request into a strict JSON object for a workflow deep-dive.
+
+      ## User Request
+      $ARGUMENTS
+
+      ## Rules
+      1. Extract the target Archon workflow name.
+      2. If the user explicitly supplied a run ID, capture it in `requested_run_id`.
+      3. Do NOT assume we should execute the target workflow.
+      4. Dynamic analysis only means reading an existing historical run when a run ID is explicitly provided.
+      5. If no run ID is provided, set `analysis_mode` to `static_only`.
+      6. Prefer preserving the exact workflow name the user gave when it already looks like kebab-case.
+
+      ## Output fields
+      - workflow_name
+      - requested_run_id
+      - analysis_mode: `static_only` or `static_plus_run`
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        workflow_name:
+          type: string
+        requested_run_id:
+          type: string
+        analysis_mode:
+          type: string
+          enum: ["static_only", "static_plus_run"]
+      required: [workflow_name, requested_run_id, analysis_mode]
+
+  - id: load-workflow-definition
+    bash: |
+      bun -e '
+      import { writeFileSync } from "node:fs";
+      import { discoverWorkflowsWithConfig } from "./packages/workflows/src/workflow-discovery";
+      import { resolveWorkflowName } from "./packages/workflows/src/router";
+      import { loadConfig } from "./packages/core/src/config";
+
+      const requested = $resolve-target.output.workflow_name;
+      const result = await discoverWorkflowsWithConfig(process.cwd(), loadConfig);
+      const all = result.workflows.map(entry => entry.workflow);
+      const matched = resolveWorkflowName(requested, all);
+
+      if (!matched) {
+        throw new Error(`Workflow not found: ${requested}`);
+      }
+
+      const matchedEntry = result.workflows.find(entry => entry.workflow.name === matched.name);
+      if (!matchedEntry) {
+        throw new Error(`Resolved workflow entry missing: ${matched.name}`);
+      }
+
+      const payload = {
+        requestedName: requested,
+        resolvedName: matched.name,
+        source: matchedEntry.source,
+        workflow: matched,
+        errors: result.errors,
+      };
+
+      writeFileSync(`$ARTIFACTS_DIR/workflow-definition.json`, JSON.stringify(payload, null, 2));
+      console.log(JSON.stringify(payload));
+      '
+    depends_on: [resolve-target]
+
+  - id: static-structure-analysis
+    prompt: |
+      You are analyzing an Archon workflow definition and producing static analysis notes.
+
+      ## Request Context
+      - Requested workflow name: $resolve-target.output.workflow_name
+      - Resolved workflow name: $load-workflow-definition.output.resolvedName
+      - Source: $load-workflow-definition.output.source
+
+      ## Workflow Definition JSON
+      $load-workflow-definition.output
+
+      ## Instructions
+      Produce a concise but information-dense static analysis in Markdown.
+
+      Required sections:
+      1. `### Static Overview`
+      2. `### Full SOP (ASCII)`
+      3. `### Node Index`
+      4. `### Static Findings`
+
+      Requirements:
+      - Build an ASCII DAG/SOP based on the actual nodes and `depends_on` edges.
+      - For each node, summarize its type, purpose, upstream/downstream relationships, conditions, and likely artifact behavior.
+      - Explicitly mention branch gates such as `when`, `trigger_rule`, `approval`, `loop`, or `worktree` behavior when present.
+      - If the workflow definition suggests artifact files, call that out.
+      - Stay strictly grounded in the provided workflow JSON.
+
+      Return Markdown only.
+    depends_on: [load-workflow-definition]
+    context: fresh
+
+  - id: locate-run-sample
+    bash: |
+      bun -e '
+      import { getWorkflowRun } from "./packages/core/src/db/workflows";
+
+      const requestedRunId = $resolve-target.output.requested_run_id;
+      const expectedWorkflow = $load-workflow-definition.output.resolvedName;
+
+      if (!requestedRunId) {
+        const payload = {
+          has_run_sample: false,
+          reason: "No explicit run_id provided; dynamic analysis is skipped in this workflow version.",
+          run_id: "",
+          run_status: "",
+        };
+        console.log(JSON.stringify(payload));
+        process.exit(0);
+      }
+
+      const run = await getWorkflowRun(requestedRunId);
+      if (!run) {
+        throw new Error(`Workflow run not found: ${requestedRunId}`);
+      }
+      if (run.workflow_name !== expectedWorkflow) {
+        throw new Error(`Workflow run ${requestedRunId} belongs to ${run.workflow_name}, expected ${expectedWorkflow}`);
+      }
+
+      const payload = {
+        has_run_sample: true,
+        reason: "Explicit run_id supplied by user.",
+        run_id: run.id,
+        run_status: run.status,
+        working_path: run.working_path ?? "",
+        started_at: run.started_at,
+        completed_at: run.completed_at ?? "",
+      };
+      console.log(JSON.stringify(payload));
+      '
+    depends_on: [resolve-target, load-workflow-definition]
+
+  - id: load-run-details
+    bash: |
+      bun -e '
+      import { writeFileSync } from "node:fs";
+      import { getWorkflowRun } from "./packages/core/src/db/workflows";
+      import { listWorkflowEvents } from "./packages/core/src/db/workflow-events";
+
+      const runId = $locate-run-sample.output.run_id;
+      const run = await getWorkflowRun(runId);
+      if (!run) {
+        throw new Error(`Workflow run not found: ${runId}`);
+      }
+
+      const events = await listWorkflowEvents(runId);
+      const startTimes = new Map();
+      const summaries = new Map();
+
+      for (const event of events) {
+        const nodeId = event.step_name;
+        if (!nodeId) continue;
+        switch (event.event_type) {
+          case "node_started": {
+            startTimes.set(nodeId, new Date(event.created_at).getTime());
+            if (!summaries.has(nodeId)) summaries.set(nodeId, { nodeId, state: "running" });
+            break;
+          }
+          case "node_completed": {
+            const started = startTimes.get(nodeId);
+            const ended = new Date(event.created_at).getTime();
+            const rawOutput = event.data.node_output;
+            const output = typeof rawOutput === "string" ? rawOutput : "";
+            summaries.set(nodeId, {
+              nodeId,
+              state: "completed",
+              durationMs: started !== undefined ? ended - started : undefined,
+              outputPreview: output ? `${output.slice(0, 300)}${output.length > 300 ? "..." : ""}` : "",
+            });
+            break;
+          }
+          case "node_failed": {
+            const started = startTimes.get(nodeId);
+            const ended = new Date(event.created_at).getTime();
+            summaries.set(nodeId, {
+              nodeId,
+              state: "failed",
+              durationMs: started !== undefined ? ended - started : undefined,
+              error: typeof event.data.error === "string" ? event.data.error : "Unknown error",
+            });
+            break;
+          }
+          case "node_skipped":
+          case "node_skipped_prior_success": {
+            summaries.set(nodeId, {
+              nodeId,
+              state: "skipped",
+              reason: typeof event.data.reason === "string" ? event.data.reason : event.event_type,
+            });
+            break;
+          }
+        }
+      }
+
+      const payload = {
+        run,
+        eventCount: events.length,
+        events,
+        nodeSummaries: [...summaries.values()],
+      };
+
+      writeFileSync(`$ARTIFACTS_DIR/run-details.json`, JSON.stringify(payload, null, 2));
+      console.log(JSON.stringify(payload));
+      '
+    depends_on: [locate-run-sample]
+    when: "$locate-run-sample.output.has_run_sample == true"
+
+  - id: inspect-artifacts
+    bash: |
+      bun -e '
+      import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+      import { join, relative } from "node:path";
+      import { getWorkflowRun } from "./packages/core/src/db/workflows";
+      import { getCodebase } from "./packages/core/src/db/codebases";
+      import { getRunArtifactsPath } from "./packages/paths/src/archon-paths";
+
+      const runId = $locate-run-sample.output.run_id;
+      const run = await getWorkflowRun(runId);
+      if (!run?.codebase_id) {
+        const payload = { artifactDir: "", files: [], textArtifacts: [] };
+        writeFileSync(`$ARTIFACTS_DIR/artifact-summary.json`, JSON.stringify(payload, null, 2));
+        console.log(JSON.stringify(payload));
+        process.exit(0);
+      }
+
+      const codebase = await getCodebase(run.codebase_id);
+      if (!codebase?.name || !codebase.name.includes("/")) {
+        const payload = { artifactDir: "", files: [], textArtifacts: [] };
+        writeFileSync(`$ARTIFACTS_DIR/artifact-summary.json`, JSON.stringify(payload, null, 2));
+        console.log(JSON.stringify(payload));
+        process.exit(0);
+      }
+
+      const [owner, repo] = codebase.name.split("/");
+      const artifactDir = getRunArtifactsPath(owner, repo, runId);
+
+      if (!existsSync(artifactDir)) {
+        const payload = { artifactDir, files: [], textArtifacts: [] };
+        writeFileSync(`$ARTIFACTS_DIR/artifact-summary.json`, JSON.stringify(payload, null, 2));
+        console.log(JSON.stringify(payload));
+        process.exit(0);
+      }
+
+      const files = [];
+      const textArtifacts = [];
+
+      function walk(dir) {
+        for (const entry of readdirSync(dir)) {
+          const fullPath = join(dir, entry);
+          const stat = statSync(fullPath);
+          if (stat.isDirectory()) {
+            walk(fullPath);
+            continue;
+          }
+          const relPath = relative(artifactDir, fullPath);
+          files.push({ path: relPath, size: stat.size });
+          if (/\.(md|txt|json|log)$/i.test(relPath)) {
+            let content = "";
+            try {
+              content = readFileSync(fullPath, "utf-8");
+            } catch {
+              content = "";
+            }
+            textArtifacts.push({
+              path: relPath,
+              excerpt: content.slice(0, 1200),
+            });
+          }
+        }
+      }
+
+      walk(artifactDir);
+
+      const payload = { artifactDir, files, textArtifacts };
+      writeFileSync(`$ARTIFACTS_DIR/artifact-summary.json`, JSON.stringify(payload, null, 2));
+      console.log(JSON.stringify(payload));
+      '
+    depends_on: [locate-run-sample]
+    when: "$locate-run-sample.output.has_run_sample == true"
+
+  - id: synthesize-deep-dive
+    prompt: |
+      You are writing a workflow deep-dive document in Chinese.
+
+      The document style should resemble a serious technical deep-dive with:
+      - clear sectioning
+      - ASCII visualization
+      - node-by-node explanation
+      - explicit distinction between static analysis and observed runtime evidence
+
+      ## Target Workflow
+      - Requested: $resolve-target.output.workflow_name
+      - Resolved: $load-workflow-definition.output.resolvedName
+      - Source: $load-workflow-definition.output.source
+      - Requested run_id: $resolve-target.output.requested_run_id
+      - Dynamic mode: $resolve-target.output.analysis_mode
+
+      ## Static Analysis Notes
+      $static-structure-analysis.output
+
+      ## Run Sample Resolution
+      $locate-run-sample.output
+
+      ## Run Details JSON
+      $load-run-details.output
+
+      ## Artifact Summary JSON
+      $inspect-artifacts.output
+
+      ## Requirements
+      Write the final Markdown document to `$ARTIFACTS_DIR/workflow-deep-dive.md` using the Write tool.
+
+      Required document structure:
+      1. Title: `# <workflow-name> 工作流深度解读`
+      2. `## 对象与范围`
+      3. `## 第一部分：工作流总览`
+      4. `## 第二部分：节点深度拆解`
+      5. `## 第三部分：动态样本分析` only when a run sample exists
+      6. `## 收束小结`
+
+      Additional rules:
+      - Always explain whether the document is static-only or static+dynamic.
+      - If no run sample exists, explicitly say that dynamic behavior is inferred rather than observed.
+      - If a run sample exists, list the run ID, artifact directory, actual executed nodes, skipped nodes, and notable evidence.
+      - Prefer concrete node names and artifact paths over generic prose.
+      - Do not claim that the workflow was executed during this analysis.
+      - Keep the tone analytical, not promotional.
+
+      After writing the file, return a short summary including the output path.
+    depends_on: [static-structure-analysis, locate-run-sample]
+    trigger_rule: all_success
+
+  - id: finalize-report
+    prompt: |
+      Summarize the deep-dive generation result for the user.
+
+      ## Target Workflow
+      - Resolved: $load-workflow-definition.output.resolvedName
+      - Requested run_id: $resolve-target.output.requested_run_id
+
+      ## Run Sample Resolution
+      $locate-run-sample.output
+
+      ## Deep Dive Result
+      $synthesize-deep-dive.output
+
+      Requirements:
+      - Mention whether the output is static-only or static+dynamic.
+      - Mention the final document path: `$ARTIFACTS_DIR/workflow-deep-dive.md`
+      - Mention that the target workflow itself was not executed by this analysis workflow.
+    depends_on: [synthesize-deep-dive]
